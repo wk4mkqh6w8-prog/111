@@ -233,11 +233,11 @@ async def _render_referral_html(user_id: int) -> str:
     deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
     return (
         "🎁 <b>Реферальная программа</b>\n\n"
-        f"Приглашайте друзей по ссылке и получайте <b>+{REF_BОНУС}</b> бесплатных заявок за каждого!\n\n"
+        f"Приглашайте друзей по ссылке и получайте <b>+{REF_BONUS}</b> бесплатных заявок за каждого!\n\n"
         f"🔗 Ваша ссылка:\n{deep_link}\n\n"
         "Как это работает:\n"
         "• Человек нажимает по ссылке и жмёт /start\n"
-        f"• Вам автоматически начисляется <b>+{REF_BОНУС}</b> заявок\n"
+        f"• Вам автоматически начисляется <b>+{REF_BONUS}</b> заявок\n"
         "• Бонусы суммируются и расходуются после дневного лимита\n"
     )
 
@@ -358,7 +358,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚫 Лимит исчерпан.\n"
         f"— Дневной лимит: {DAILY_LIMIT}/день\n"
-        f"— Реферальные бонусы: получите +{REF_BОНУС} заявок за каждого приглашённого!\n\n"
+        f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
         "Купите подписку «💳 Купить подписку» для безлимита."
     )
 
@@ -469,7 +469,8 @@ async def cryptopay_webhook(request: Request):
     inv_new = data.get("payload") or {}
     if update_type == "invoice_paid" and isinstance(inv_new, dict):
         raw_uid = inv_new.get("payload")
-        if raw_uid is not None:
+        status_new = inv_new.get("status")
+        if raw_uid is not None and (status_new is None or status_new == "paid"):
             try:
                 user_id = int(str(raw_uid))
                 paid = True
@@ -489,15 +490,36 @@ async def cryptopay_webhook(request: Request):
                 user_id = None
 
     if paid and user_id:
-        expires_at = (datetime.now() + timedelta(days=30)).isoformat()
-        await set_premium(user_id, expires_at)
+        # 1) выдаём/продлеваем премиум на 30 дней
+        expires_dt = datetime.now() + timedelta(days=30)
+        expires_at_iso = expires_dt.isoformat()
+        await set_premium(user_id, expires_at_iso)
+
+        # 2) красивое уведомление пользователю
         try:
+            text = (
+                "✅ <b>Оплата получена</b>!\n"
+                f"Премиум активирован до <b>{expires_dt.strftime('%d.%m.%Y')}</b>.\n\n"
+                "Что дальше?\n"
+                "• Откройте профиль — проверить статус и реф. ссылку\n"
+                "• Выберите модель — переключиться на нужную LLM\n"
+                "• Или просто напишите сообщение 🙂"
+            )
             await application.bot.send_message(
                 chat_id=user_id,
-                text="✅ Оплата получена! Подписка активирована на 30 дней."
+                text=text,
+                parse_mode="HTML",
+                reply_markup=main_keyboard()
             )
         except Exception:
-            pass
+            # запасной вариант — простой текст
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Оплата получена! Премиум активирован на 30 дней."
+                )
+            except Exception:
+                pass
 
     return {"ok": True}
 
