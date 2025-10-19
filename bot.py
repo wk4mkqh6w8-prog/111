@@ -40,11 +40,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger("neurobot")
 
-# Модели
+# Модели (реальные — для движка)
 MODEL_OPENAI   = "OpenAI · GPT-4o-mini"
 MODEL_DEEPSEEK = "DeepSeek · Chat"
 DEFAULT_MODEL  = MODEL_OPENAI
-_user_model: dict[int, str] = {}
+
+# Выбор пользователя
+_user_model_visual: dict[int, str] = {}  # «название модели» которое видит пользователь
+_user_model: dict[int, str] = {}         # фактический backend (OpenAI/DeepSeek)
+
+# РЕЖИМЫ (ярлыки): реально влияют на подсказку
+TASK_MODES = {
+    "default": {
+        "label": "Стандарт",
+        "system": (
+            "You are a helpful, concise assistant. Prefer clear steps and short answers unless "
+            "the user asks for depth."
+        ),
+    },
+    "coding": {
+        "label": "Кодинг",
+        "system": (
+            "You are a senior software engineer. Provide runnable code with comments, point out pitfalls, "
+            "and show minimal examples. Prefer Python/JS unless the user specifies otherwise."
+        ),
+    },
+    "seo": {
+        "label": "SEO",
+        "system": (
+            "You are an SEO strategist. Produce keyword-rich but natural copy, suggest title/H1/meta, "
+            "and include semantic clusters and internal linking ideas when useful."
+        ),
+    },
+    "translate": {
+        "label": "Перевод",
+        "system": (
+            "You are a professional translator (RU↔EN). Preserve meaning, tone, and idioms. "
+            "If the source is ambiguous, offer the two best variants."
+        ),
+    },
+    "summarize": {
+        "label": "Резюме",
+        "system": (
+            "You are a world-class summarizer. Output structured bullet points, key facts, and action items. "
+            "Keep it brief unless asked to expand."
+        ),
+    },
+    "creative": {
+        "label": "Креатив",
+        "system": (
+            "You are a creative copywriter. Offer punchy hooks, strong voice, and multiple variants when helpful. "
+            "Avoid clichés."
+        ),
+    },
+}
+_user_task_mode: dict[int, str] = {}  # хранит ключ режима пользователя
 
 # OpenAI клиент
 oai = OpenAI(api_key=OPENAI_KEY)
@@ -70,15 +120,25 @@ REF_BONUS   = 25
 DAILY_LIMIT = 5
 
 # ---------- LLM ----------
-def _ask_openai(prompt: str) -> str:
+def _compose_prompt(user_id: int, user_text: str) -> list[dict]:
+    """Собираем сообщения с учётом выбранного режима."""
+    mode_key = _user_task_mode.get(user_id, "default")
+    sys_text = TASK_MODES.get(mode_key, TASK_MODES["default"])["system"]
+    return [
+        {"role": "system", "content": sys_text},
+        {"role": "user", "content": user_text},
+    ]
+
+def _ask_openai(user_id: int, prompt: str) -> str:
+    msgs = _compose_prompt(user_id, prompt)
     r = oai.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
+        messages=msgs,
         temperature=0.7,
     )
     return r.choices[0].message.content
 
-def _ask_deepseek(prompt: str) -> str:
+def _ask_deepseek(user_id: int, prompt: str) -> str:
     if not DEEPSEEK_KEY:
         return "DeepSeek недоступен: не задан DEEPSEEK_KEY."
     try:
@@ -87,7 +147,7 @@ def _ask_deepseek(prompt: str) -> str:
         headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": _compose_prompt(user_id, prompt),
             "temperature": 0.7,
         }
         with httpx.Client(timeout=30) as s:
@@ -108,26 +168,72 @@ def _ask_deepseek(prompt: str) -> str:
         return f"Ошибка DeepSeek: {e!s}"
 
 def ask_llm(user_id: int, prompt: str) -> str:
-    model = _user_model.get(user_id, DEFAULT_MODEL)
-    if model == MODEL_DEEPSEEK:
-        return _ask_deepseek(prompt)
-    return _ask_openai(prompt)
+    real = _user_model.get(user_id, DEFAULT_MODEL)
+    if real == MODEL_DEEPSEEK:
+        return _ask_deepseek(user_id, prompt)
+    return _ask_openai(user_id, prompt)
 
 # ---------- UI ----------
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Выбрать модель", callback_data="models")],
+        [InlineKeyboardButton("🎛 Режимы", callback_data="modes")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
     ])
 
-def models_keyboard() -> InlineKeyboardMarkup:
+# ===== Меню моделей =====
+def _models_menu_text(mode: str = "short") -> str:
+    if mode == "short":
+        return (
+            "Claude 4.5 Sonnet\n"
+            "🚗 Средний: GPT-5, OpenAI o4-mini, Claude 3.5 Haiku\n"
+            "🚲 Базовый: GPT-5 mini, GPT-4o mini, Gemini Flash 2.5, DeepSeek V3.2\n\n"
+            "Выберите модель для работы:"
+        )
+    else:
+        return (
+            "<b>О моделях</b>\n"
+            "• Топовые подойдут для сложных задач и длинных текстов.\n"
+            "• Средние — баланс скорости и качества.\n"
+            "• Базовые — быстрые ответы на повседневные вопросы.\n\n"
+            "Выберите модель:"
+        )
+
+def models_keyboard_visual() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("OpenAI · GPT-4o-mini", callback_data="m:oai")],
-        [InlineKeyboardButton("DeepSeek · Chat",     callback_data="m:ds")],
-        [InlineKeyboardButton("⬅️ Назад",            callback_data="home")],
+        [InlineKeyboardButton("🔸 Кратко",  callback_data="mvis:short"),
+         InlineKeyboardButton("ℹ️ Подробно", callback_data="mvis:full")],
+        [InlineKeyboardButton("Claude 3.5 Haiku", callback_data="mvis:sel:Claude 3.5 Haiku"),
+         InlineKeyboardButton("✅ GPT-5",         callback_data="mvis:sel:GPT-5")],
+        [InlineKeyboardButton("Claude 4.5 Sonnet", callback_data="mvis:sel:Claude 4.5 Sonnet"),
+         InlineKeyboardButton("Gemini 2.5 Pro",    callback_data="mvis:sel:Gemini 2.5 Pro")],
+        [InlineKeyboardButton("OpenAI o3",         callback_data="mvis:sel:OpenAI o3"),
+         InlineKeyboardButton("DeepSeek V3.2",     callback_data="mvis:sel:DeepSeek V3.2")],
+        [InlineKeyboardButton("OpenAI o4-mini",    callback_data="mvis:sel:OpenAI o4-mini"),
+         InlineKeyboardButton("GPT-5 mini",        callback_data="mvis:sel:GPT-5 mini")],
+        [InlineKeyboardButton("GPT-4o search 🔎",  callback_data="mvis:sel:GPT-4o search"),
+         InlineKeyboardButton("GPT-4o mini",       callback_data="mvis:sel:GPT-4o mini")],
+        [InlineKeyboardButton("Gemini 2.5 Flash",  callback_data="mvis:sel:Gemini 2.5 Flash")],
+        [InlineKeyboardButton("⬅️ Назад",          callback_data="home")],
     ])
+
+# ===== Меню режимов (ярлыки) =====
+def modes_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Стандарт", callback_data="mode:default"),
+         InlineKeyboardButton("Кодинг",   callback_data="mode:coding")],
+        [InlineKeyboardButton("SEO",      callback_data="mode:seo"),
+         InlineKeyboardButton("Перевод",  callback_data="mode:translate")],
+        [InlineKeyboardButton("Резюме",   callback_data="mode:summarize"),
+         InlineKeyboardButton("Креатив",  callback_data="mode:creative")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="home")],
+    ])
+
+def current_mode_label(user_id: int) -> str:
+    key = _user_task_mode.get(user_id, "default")
+    return TASK_MODES.get(key, TASK_MODES["default"])["label"]
 
 # =========================
 # /start + рефералка
@@ -170,7 +276,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(text, reply_markup=main_keyboard())
     else:
-        # на всякий случай, если старт по кнопке меню
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=main_keyboard())
 
 # =========================
@@ -192,12 +297,16 @@ async def _render_profile_html(user_id: int) -> str:
 
     me = await application.bot.get_me()
     deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
+    visual = _user_model_visual.get(user_id, "GPT-4o mini")
+    mode_lbl = current_mode_label(user_id)
 
     return (
         f"👤 <b>Профиль</b>\n"
         f"ID: <code>{user_id}</code>\n"
         f"Статус: <b>{status}</b>\n"
-        f"Осталось заявок: <b>{left_text}</b>\n\n"
+        f"Осталось заявок: <b>{left_text}</b>\n"
+        f"Модель: <b>{visual}</b>\n"
+        f"Режим: <b>{mode_lbl}</b>\n\n"
         f"🔗 <b>Ваша реферальная ссылка:</b>\n{deep_link}\n\n"
         f"За каждого приглашённого: +{REF_BONUS} заявок."
     )
@@ -210,20 +319,14 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_profile_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        txt = await _render_profile_html(q.from_user.id)
-        try:
-            await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
-        except Exception:
-            await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
-    except Exception as e:
-        try:
-            await q.answer(f"Ошибка: {e}", show_alert=True)
-        except Exception:
-            pass
+        await q.answer()
+    except Exception:
+        pass
+    txt = await _render_profile_html(q.from_user.id)
+    try:
+        await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
 
 # =========================
 # Рефералка
@@ -249,59 +352,102 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_ref_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        txt = await _render_referral_html(q.from_user.id)
-        try:
-            await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
-        except Exception:
-            await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
-    except Exception as e:
-        try:
-            await q.answer(f"Ошибка: {e}", show_alert=True)
-        except Exception:
-            pass
+        await q.answer()
+    except Exception:
+        pass
+    txt = await _render_referral_html(q.from_user.id)
+    try:
+        await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
 
 # =========================
-# Выбор модели
+# Визуальный выбор модели
 # =========================
 async def on_models_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        try:
-            await q.message.edit_text("Выбери модель:", reply_markup=models_keyboard())
-        except Exception:
-            await q.message.reply_text("Выбери модель:", reply_markup=models_keyboard())
+        await q.answer()
     except Exception:
         pass
+    text = _models_menu_text("short")
+    try:
+        await q.message.edit_text(text, parse_mode="HTML", reply_markup=models_keyboard_visual())
+    except Exception:
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=models_keyboard_visual())
 
-async def on_model_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_models_view_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        if q.data == "m:oai":
-            _user_model[q.from_user.id] = MODEL_OPENAI
-            msg = "✅ Модель установлена: OpenAI · GPT-4o-mini"
-        elif q.data == "m:ds":
-            _user_model[q.from_user.id] = MODEL_DEEPSEEK
-            msg = "✅ Модель установлена: DeepSeek · Chat"
-        else:
-            msg = "Неизвестная модель."
-        try:
-            await q.message.edit_text(msg, reply_markup=main_keyboard())
-        except Exception:
-            await q.message.reply_text(msg, reply_markup=main_keyboard())
+        await q.answer()
     except Exception:
         pass
+    mode = "short" if q.data == "mvis:short" else "full"
+    text = _models_menu_text(mode)
+    try:
+        await q.message.edit_text(text, parse_mode="HTML", reply_markup=models_keyboard_visual())
+    except Exception:
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=models_keyboard_visual())
+
+async def on_model_visual_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    label = (q.data or "").split("mvis:sel:", 1)[-1].strip() or "GPT-4o mini"
+
+    _user_model_visual[q.from_user.id] = label
+    # простая логика: всё, что содержит DeepSeek — на DeepSeek, остальное — OpenAI
+    if "DeepSeek" in label:
+        _user_model[q.from_user.id] = MODEL_DEEPSEEK
+    else:
+        _user_model[q.from_user.id] = MODEL_OPENAI
+
+    msg = f"✅ Модель «{label}» установлена.\nМожно писать сообщение!"
+    try:
+        await q.message.edit_text(msg, reply_markup=main_keyboard())
+    except Exception:
+        await q.message.reply_text(msg, reply_markup=main_keyboard())
+
+# =========================
+# Режимы (ярлыки)
+# =========================
+async def on_modes_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    txt = (
+        "Выберите режим ответа:\n"
+        "• <b>Стандарт</b> — обычные ответы\n"
+        "• <b>Кодинг</b> — больше кода и примеров\n"
+        "• <b>SEO</b> — тексты и структура для SEO\n"
+        "• <b>Перевод</b> — RU↔EN, аккуратный стиль\n"
+        "• <b>Резюме</b> — краткие выжимки\n"
+        "• <b>Креатив</b> — идеи, варианты, слоганы"
+    )
+    try:
+        await q.message.edit_text(txt, parse_mode="HTML", reply_markup=modes_keyboard())
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="HTML", reply_markup=modes_keyboard())
+
+async def on_mode_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    key = (q.data or "").split("mode:", 1)[-1]
+    if key not in TASK_MODES:
+        key = "default"
+    _user_task_mode[q.from_user.id] = key
+    lbl = TASK_MODES[key]["label"]
+    try:
+        await q.message.edit_text(f"✅ Режим «{lbl}» активирован. Готов работать!", reply_markup=main_keyboard())
+    except Exception:
+        await q.message.reply_text(f"✅ Режим «{lbl}» активирован. Готов работать!", reply_markup=main_keyboard())
 
 # =========================
 # Оплата (CryptoPay)
@@ -309,29 +455,26 @@ async def on_model_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        await q.answer()
+    except Exception:
+        pass
 
-        if not CRYPTOPAY_KEY:
-            await q.message.reply_text("💳 Оплата не подключена (нет CRYPTOPAY_KEY).")
-            return
+    if not CRYPTOPAY_KEY:
+        await q.message.reply_text("💳 Оплата не подключена (нет CRYPTOPAY_KEY).")
+        return
 
-        payload = str(q.from_user.id)
-        headers = {"Crypto-Pay-API-Token": CRYPTOPAY_KEY}
-        data = {
-            "asset": "USDT",
-            "amount": "3",
-            "description": "Подписка на 30 дней",
-            "payload": payload,
-        }
-        r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
-        j = r.json()
-        url = j["result"]["pay_url"]
-        await q.message.reply_text(f"💳 Оплати подписку по ссылке:\n{url}")
-    except Exception as e:
-        await q.message.reply_text(f"❌ Не удалось создать счёт: {e}")
+    payload = str(q.from_user.id)
+    headers = {"Crypto-Pay-API-Token": CRYPTOPAY_KEY}
+    data = {
+        "asset": "USDT",
+        "amount": "3",
+        "description": "Подписка на 30 дней",
+        "payload": payload,
+    }
+    r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
+    j = r.json()
+    url = j["result"]["pay_url"]
+    await q.message.reply_text(f"💳 Оплати подписку по ссылке:\n{url}")
 
 # =========================
 # Сообщения пользователей
@@ -405,10 +548,9 @@ async def cmd_remove_premium(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     try:
         if not context.args:
-            await update.message.reply_text("Формат: /remove_premium <user_id>")
+            await update.message.reply_text("Формат: /remove_pремиum <user_id>")
             return
         uid = int(context.args[0])
-        # снять премиум — ставим истёкшую дату
         await set_premium(uid, (datetime.now() - timedelta(days=1)).isoformat())
         await update.message.reply_text(f"❎ Премиум снят у {uid}.")
         try:
@@ -425,8 +567,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Формат: /broadcast <text>")
         return
     text = " ".join(context.args)
-    # простая рассылка: всем платникам (демо) — можно расширить
-    # здесь для краткости просто подтверждаем
     await update.message.reply_text(f"Ок, отправлю: {text}\n(реальную рассылку можно дописать в db.py)")
 
 # =========================
@@ -444,11 +584,7 @@ async def telegram_webhook(request: Request):
 
 @app.post("/cryptopay-webhook")
 async def cryptopay_webhook(request: Request):
-    """
-    Обработчик вебхуков Crypto Pay.
-    Поддерживает актуальный формат (update_type=invoice_paid, данные в data['payload'])
-    и старый формат (data['invoice']).
-    """
+    """Обработчик вебхуков Crypto Pay (update_type=invoice_paid)."""
     global application
     try:
         data = await request.json()
@@ -456,7 +592,6 @@ async def cryptopay_webhook(request: Request):
         return {"ok": False, "error": "bad json"}
 
     try:
-        # Лёгкий лог на время отладки (можно отключить позже)
         logger.info("CryptoPay webhook: %s", data)
     except Exception:
         pass
@@ -464,7 +599,7 @@ async def cryptopay_webhook(request: Request):
     user_id = None
     paid = False
 
-    # Новый/актуальный формат от Crypto Pay
+    # Новый формат
     update_type = data.get("update_type")
     inv_new = data.get("payload") or {}
     if update_type == "invoice_paid" and isinstance(inv_new, dict):
@@ -477,7 +612,7 @@ async def cryptopay_webhook(request: Request):
             except Exception:
                 user_id = None
 
-    # Совместимость со старым форматом (если когда-то включали другой webhook)
+    # Совместимость со старым форматом
     if not paid:
         invoice = data.get("invoice") or {}
         status = invoice.get("status")
@@ -490,19 +625,15 @@ async def cryptopay_webhook(request: Request):
                 user_id = None
 
     if paid and user_id:
-        # 1) выдаём/продлеваем премиум на 30 дней
         expires_dt = datetime.now() + timedelta(days=30)
-        expires_at_iso = expires_dt.isoformat()
-        await set_premium(user_id, expires_at_iso)
-
-        # 2) красивое уведомление пользователю
+        await set_premium(user_id, expires_dt.isoformat())
         try:
             text = (
                 "✅ <b>Оплата получена</b>!\n"
                 f"Премиум активирован до <b>{expires_dt.strftime('%d.%m.%Y')}</b>.\n\n"
                 "Что дальше?\n"
                 "• Откройте профиль — проверить статус и реф. ссылку\n"
-                "• Выберите модель — переключиться на нужную LLM\n"
+                "• Выберите модель — переключиться на нужный режим\n"
                 "• Или просто напишите сообщение 🙂"
             )
             await application.bot.send_message(
@@ -512,7 +643,6 @@ async def cryptopay_webhook(request: Request):
                 reply_markup=main_keyboard()
             )
         except Exception:
-            # запасной вариант — простой текст
             try:
                 await application.bot.send_message(
                     chat_id=user_id,
@@ -542,9 +672,7 @@ def _keepalive_loop():
             pass
 
 async def _webhook_guard_loop():
-    """
-    Раз в 10 минут проверяем webhook и чиним, если он слетел.
-    """
+    """Раз в 10 минут проверяем webhook и чиним, если он слетел."""
     await asyncio.sleep(8)
     while True:
         try:
@@ -588,7 +716,10 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_profile_btn,  pattern=r"^profile$"))
     app_.add_handler(CallbackQueryHandler(on_ref_btn,      pattern=r"^ref$"))
     app_.add_handler(CallbackQueryHandler(on_models_btn,   pattern=r"^models$"))
-    app_.add_handler(CallbackQueryHandler(on_model_select, pattern=r"^m:(oai|ds)$"))
+    app_.add_handler(CallbackQueryHandler(on_models_view_toggle, pattern=r"^mvis:(short|full)$"))
+    app_.add_handler(CallbackQueryHandler(on_model_visual_select, pattern=r"^mvis:sel:.+$"))
+    app_.add_handler(CallbackQueryHandler(on_modes_btn,    pattern=r"^modes$"))
+    app_.add_handler(CallbackQueryHandler(on_mode_select,  pattern=r"^mode:(default|coding|seo|translate|summarize|creative)$"))
     app_.add_handler(CallbackQueryHandler(
         lambda u, c: u.callback_query.message.edit_text("Главное меню:", reply_markup=main_keyboard()),
         pattern=r"^home$"
@@ -620,7 +751,6 @@ async def on_startup():
     logger.info("✅ Установлен Telegram webhook: %s", webhook_url)
 
     threading.Thread(target=_keepalive_loop, daemon=True).start()
-    # guard-корутина
     asyncio.get_event_loop().create_task(_webhook_guard_loop())
 
     logger.info("🚀 Startup complete. Listening on port %s", PORT)
