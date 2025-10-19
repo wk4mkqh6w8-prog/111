@@ -241,5 +241,12 @@ async def init_bot_and_webhook():
     logger.info(f"✅ Установлен Telegram webhook: {webhook_url}")
 
 if __name__ == "__main__":
-    asyncio.run(init_bot_and_webhook())
+    import asyncio
+
+    async def main_async():
+        global application
+        application = ApplicationBuilder().token(BOT_TOKEN).build()
+        await init_bot_and_webhook()
+
+    asyncio.run(main_async())
     uvicorn.run(app, host="0.0.0.0", port=PORT)
