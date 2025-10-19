@@ -47,6 +47,13 @@ from db import init_db, add_user, is_premium, can_send_message, set_premium  # n
 # FastAPI (webhook для CryptoPay)
 # --------------------
 app = FastAPI(title="NeuroBot API")
+# === Webhook для Telegram ===
+@app.post("/tg")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return {"ok": True}
 
 @app.post("/cryptopay-webhook")
 async def cryptopay_webhook(request: Request):
@@ -213,9 +220,26 @@ def main():
     application.add_handler(CallbackQueryHandler(on_neuro_btn, pattern="^neuro$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    # Запуск
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # === Запуск с webhook (Render) ===
+import asyncio
+import uvicorn
 
+async def init_bot_and_webhook():
+    global application
+    await application.initialize()
+    await application.start()
+
+    public_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
+    if not public_url:
+        raise RuntimeError(
+            "❌ Не найден PUBLIC_URL. На Render он задаётся автоматически. "
+            "Локально можно задать вручную."
+        )
+
+    webhook_url = f"{public_url}/tg"
+    await application.bot.set_webhook(webhook_url)
+    logger.info(f"✅ Установлен Telegram webhook: {webhook_url}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(init_bot_and_webhook())
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
