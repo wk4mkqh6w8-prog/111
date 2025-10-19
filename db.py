@@ -1,5 +1,4 @@
 import os
-import asyncio
 from datetime import datetime, timezone, date
 
 import aiosqlite
@@ -11,18 +10,18 @@ DB_PATH = os.getenv("DATABASE_PATH", "/tmp/neurobot.sqlite3")
 # ========= ВСПОМОГАТЕЛЬНЫЕ =========
 
 def _utcnow_iso() -> str:
+    # ISO-8601 в UTC: подходит для лексикографического сравнения строк
     return datetime.now(timezone.utc).isoformat()
 
 def _today_str() -> str:
-    return date.today().isoformat()  # локальная календарная дата
+    # Локальная календарная дата YYYY-MM-DD (для дневного лимита)
+    return date.today().isoformat()
 
 
 # ========= ИНИЦИАЛИЗАЦИЯ =========
 
 async def init_db():
-    """
-    Создаём таблицы, если их нет.
-    """
+    """Создаём таблицы, если их нет."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(
             """
@@ -38,9 +37,9 @@ async def init_db():
 
             -- Сообщения пользователя (для дневного лимита)
             CREATE TABLE IF NOT EXISTS messages (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id   INTEGER NOT NULL,
-                created_at TEXT   NOT NULL
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_user_date
               ON messages(user_id, created_at);
@@ -51,13 +50,17 @@ async def init_db():
                 expires_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_premiums_expires
+              ON premiums(expires_at);
 
-            -- События активации премиума (для статистики оплат)
+            -- События активации/продления премиума (для статистики)
             CREATE TABLE IF NOT EXISTS premium_events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL,
-                activated_at TEXT NOT NULL
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                activated_at TEXT    NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_premium_events_day
+              ON premium_events(activated_at);
             """
         )
         await db.commit()
@@ -66,9 +69,7 @@ async def init_db():
 # ========= ПОЛЬЗОВАТЕЛИ / РЕФЕРАЛКИ =========
 
 async def add_user(user_id: int):
-    """
-    Создаём запись о пользователе, если её ещё нет.
-    """
+    """Создаём запись о пользователе, если её ещё нет."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -82,19 +83,17 @@ async def add_user(user_id: int):
 
 async def set_referrer_if_empty(user_id: int, referrer_id: int) -> bool:
     """
-    Привязываем реферера, только если реферер ещё не установлен.
+    Привязываем реферера, только если ещё не установлен.
     Возвращает True, если привязали впервые.
     """
     if user_id == referrer_id:
         return False
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверим, есть ли запись и установлен ли referrer
         cur = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
         await cur.close()
 
         if row is None:
-            # создадим пользователя и установим реферера
             await db.execute(
                 "INSERT INTO users(user_id, created_at, referrer_id, free_credits) VALUES (?, ?, ?, 0)",
                 (user_id, _utcnow_iso(), referrer_id),
@@ -113,10 +112,17 @@ async def set_referrer_if_empty(user_id: int, referrer_id: int) -> bool:
         return False
 
 
+async def get_referrer_id(user_id: int) -> int | None:
+    """Вернёт referrer_id или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row and row[0] is not None else None
+
+
 async def add_free_credits(user_id: int, n: int):
-    """
-    Начислить бонусные кредиты (например, за реферала).
-    """
+    """Начислить бонусные кредиты (например, за реферала)."""
     if n <= 0:
         return
     async with aiosqlite.connect(DB_PATH) as db:
@@ -166,9 +172,7 @@ async def consume_free_credit(user_id: int) -> bool:
 # ========= ДНЕВНОЙ ЛИМИТ =========
 
 async def get_usage_today(user_id: int) -> int:
-    """
-    Сколько сообщений (заявок) пользователь уже отправил сегодня (календарный день).
-    """
+    """Сколько сообщений пользователь уже отправил сегодня (календарный день)."""
     day = _today_str()  # YYYY-MM-DD
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -199,15 +203,13 @@ async def can_send_message(user_id: int, limit: int = 5) -> bool:
             (user_id, _utcnow_iso()),
         )
         await db.commit()
-        return True
+    return True
 
 
 # ========= ПРЕМИУМ =========
 
 async def is_premium(user_id: int) -> bool:
-    """
-    Активен ли премиум сейчас.
-    """
+    """Активен ли премиум сейчас."""
     now = _utcnow_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -218,13 +220,11 @@ async def is_premium(user_id: int) -> bool:
         await cur.close()
         if not row:
             return False
-        return row[0] > now  # сравнение ISO строк корректно для ISO-8601 UTC
+        return row[0] > now  # корректно для ISO-8601 UTC строк
 
 
 async def set_premium(user_id: int, expires_at_iso: str):
-    """
-    Выдаёт/продлевает премиум. Логируем событие для статистики.
-    """
+    """Выдаёт/продлевает премиум + логирует событие для статистики."""
     now = _utcnow_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -237,7 +237,6 @@ async def set_premium(user_id: int, expires_at_iso: str):
             """,
             (user_id, expires_at_iso, now),
         )
-        # событие покупки/активации
         await db.execute(
             "INSERT INTO premium_events(user_id, activated_at) VALUES (?, ?)",
             (user_id, now),
@@ -245,12 +244,17 @@ async def set_premium(user_id: int, expires_at_iso: str):
         await db.commit()
 
 
+async def revoke_premium(user_id: int):
+    """Снять премиум (удалить запись из premiums)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM premiums WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
 # ========= СТАТИСТИКА ДЛЯ АДМИНКИ =========
 
 async def count_paid_users_today() -> int:
-    """
-    Сколько активаций премиума сегодня (по событиям).
-    """
+    """Сколько активаций/продлений премиума сегодня (по событиям)."""
     day = _today_str()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -266,9 +270,7 @@ async def count_paid_users_today() -> int:
 
 
 async def count_paid_users_total() -> int:
-    """
-    Сколько пользователей сейчас имеют активный премиум.
-    """
+    """Сколько пользователей сейчас имеют активный премиум."""
     now = _utcnow_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
