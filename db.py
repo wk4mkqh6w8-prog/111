@@ -1,171 +1,280 @@
-import aiosqlite
-from datetime import datetime, date
+import os
+import asyncio
+from datetime import datetime, timezone, date
 
-DB_NAME = "users.db"
+import aiosqlite
+
+# Путь к БД (можно переопределить переменной окружения)
+DB_PATH = os.getenv("DATABASE_PATH", "/tmp/neurobot.sqlite3")
+
+
+# ========= ВСПОМОГАТЕЛЬНЫЕ =========
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _today_str() -> str:
+    return date.today().isoformat()  # локальная календарная дата
+
+
+# ========= ИНИЦИАЛИЗАЦИЯ =========
 
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # пользователи
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE,
-            premium INTEGER DEFAULT 0,
-            expires_at TEXT,
-            messages_today INTEGER DEFAULT 0,
-            last_reset TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            model TEXT
+    """
+    Создаём таблицы, если их нет.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+
+            -- Пользователь
+            CREATE TABLE IF NOT EXISTS users (
+                user_id       INTEGER PRIMARY KEY,
+                created_at    TEXT    NOT NULL,
+                referrer_id   INTEGER,
+                free_credits  INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Сообщения пользователя (для дневного лимита)
+            CREATE TABLE IF NOT EXISTS messages (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL,
+                created_at TEXT   NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_user_date
+              ON messages(user_id, created_at);
+
+            -- Премиум статус
+            CREATE TABLE IF NOT EXISTS premiums (
+                user_id     INTEGER PRIMARY KEY,
+                expires_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
+            -- События активации премиума (для статистики оплат)
+            CREATE TABLE IF NOT EXISTS premium_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                activated_at TEXT NOT NULL
+            );
+            """
         )
-        """)
-        # платежи
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            amount REAL,
-            asset TEXT,
-            paid_at TEXT
-        )
-        """)
-
-        # миграции на случай старой базы
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN model TEXT")
-        except Exception:
-            pass
-        await db.execute("UPDATE users SET model = COALESCE(model, 'openai:gpt-4o-mini')")
-
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
-        except Exception:
-            pass
-
         await db.commit()
 
-async def add_user(tg_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            INSERT OR IGNORE INTO users (tg_id, messages_today, last_reset, model)
-            VALUES (?, 0, ?, 'openai:gpt-4o-mini')
-        """, (tg_id, date.today().isoformat()))
-        await db.commit()
 
-async def set_premium(tg_id: int, expires_at: str):
-    async with aiosqlite.connect(DB_NAME) as db:
+# ========= ПОЛЬЗОВАТЕЛИ / РЕФЕРАЛКИ =========
+
+async def add_user(user_id: int):
+    """
+    Создаём запись о пользователе, если её ещё нет.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET premium = 1, expires_at = ? WHERE tg_id = ?",
-            (expires_at, tg_id)
+            """
+            INSERT OR IGNORE INTO users(user_id, created_at, referrer_id, free_credits)
+            VALUES (?, ?, NULL, 0)
+            """,
+            (user_id, _utcnow_iso()),
         )
         await db.commit()
 
-async def remove_premium(tg_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE users SET premium = 0, expires_at = NULL WHERE tg_id = ?",
-            (tg_id,)
-        )
-        await db.commit()
 
-async def is_premium(tg_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT premium, expires_at FROM users WHERE tg_id = ?", (tg_id,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return False
-            premium, expires_at = row
-            if premium and expires_at:
-                try:
-                    if datetime.now() < datetime.fromisoformat(expires_at):
-                        return True
-                except Exception:
-                    pass
-            # истёк — снимем
-            await db.execute("UPDATE users SET premium = 0, expires_at = NULL WHERE tg_id = ?", (tg_id,))
-            await db.commit()
-            return False
+async def set_referrer_if_empty(user_id: int, referrer_id: int) -> bool:
+    """
+    Привязываем реферера, только если реферер ещё не установлен.
+    Возвращает True, если привязали впервые.
+    """
+    if user_id == referrer_id:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверим, есть ли запись и установлен ли referrer
+        cur = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
 
-async def can_send_message(tg_id: int, limit: int = 5) -> bool:
-    today = date.today().isoformat()
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT messages_today, last_reset FROM users WHERE tg_id = ?",
-            (tg_id,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        if not row:
-            await add_user(tg_id)
-            messages_today, last_reset = 0, today
-        else:
-            messages_today, last_reset = row
-
-        # новый день — сброс
-        if last_reset != today:
+        if row is None:
+            # создадим пользователя и установим реферера
             await db.execute(
-                "UPDATE users SET messages_today = 0, last_reset = ? WHERE tg_id = ?",
-                (today, tg_id)
-            )
-            await db.commit()
-            messages_today = 0
-
-        if messages_today < limit:
-            await db.execute(
-                "UPDATE users SET messages_today = messages_today + 1 WHERE tg_id = ?",
-                (tg_id,)
+                "INSERT INTO users(user_id, created_at, referrer_id, free_credits) VALUES (?, ?, ?, 0)",
+                (user_id, _utcnow_iso(), referrer_id),
             )
             await db.commit()
             return True
+
+        if row[0] is None:
+            await db.execute(
+                "UPDATE users SET referrer_id = ? WHERE user_id = ?",
+                (referrer_id, user_id),
+            )
+            await db.commit()
+            return True
+
         return False
 
-# ---- выбор модели ----
-async def set_model(tg_id: int, model_code: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET model = ? WHERE tg_id = ?", (model_code, tg_id))
-        await db.commit()
 
-async def get_model(tg_id: int) -> str:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT model FROM users WHERE tg_id = ?", (tg_id,)) as cur:
-            row = await cur.fetchone()
-            return (row[0] if row and row[0] else "openai:gpt-4o-mini")
-
-# ---- Статистика / платежи ----
-async def record_payment(tg_id: int, amount: float | None, asset: str, paid_at_iso: str):
-    async with aiosqlite.connect(DB_NAME) as db:
+async def add_free_credits(user_id: int, n: int):
+    """
+    Начислить бонусные кредиты (например, за реферала).
+    """
+    if n <= 0:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO payments (tg_id, amount, asset, paid_at) VALUES (?, ?, ?, ?)",
-            (tg_id, amount, asset, paid_at_iso)
+            "UPDATE users SET free_credits = COALESCE(free_credits,0) + ? WHERE user_id = ?",
+            (n, user_id),
         )
         await db.commit()
 
-async def get_stats_today() -> dict:
-    today = date.today().isoformat()
-    async with aiosqlite.connect(DB_NAME) as db:
-        # оплаты за сегодня
-        async with db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments WHERE substr(paid_at,1,10)=?",
-            (today,)
-        ) as cur:
-            cnt, sum_amt = await cur.fetchone()
-        # новые пользователи за сегодня
-        async with db.execute(
-            "SELECT COUNT(*) FROM users WHERE substr(created_at,1,10)=?",
-            (today,)
-        ) as cur:
-            new_users = (await cur.fetchone())[0]
-    return {
-        "payments": cnt or 0,
-        "revenue_usdt": float(sum_amt or 0),
-        "new_users": new_users or 0
-    }
 
-async def get_totals() -> dict:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            users = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE premium=1") as cur:
-            premium = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM payments") as cur:
-            payments = (await cur.fetchone())[0]
-    return {"users": users or 0, "premium": premium or 0, "payments": payments or 0}
+async def get_free_credits(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(free_credits,0) FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row else 0
+
+
+async def consume_free_credit(user_id: int) -> bool:
+    """
+    Списать один бонусный кредит, если есть. Возвращает True, если списание выполнено.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT COALESCE(free_credits,0) FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row or int(row[0]) <= 0:
+            await db.execute("ROLLBACK")
+            await cur.close()
+            return False
+
+        await db.execute(
+            "UPDATE users SET free_credits = free_credits - 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.execute("COMMIT")
+        await cur.close()
+        return True
+
+
+# ========= ДНЕВНОЙ ЛИМИТ =========
+
+async def get_usage_today(user_id: int) -> int:
+    """
+    Сколько сообщений (заявок) пользователь уже отправил сегодня (календарный день).
+    """
+    day = _today_str()  # YYYY-MM-DD
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE user_id = ?
+              AND substr(created_at, 1, 10) = ?
+            """,
+            (user_id, day),
+        )
+        n = (await cur.fetchone())[0]
+        await cur.close()
+        return int(n)
+
+
+async def can_send_message(user_id: int, limit: int = 5) -> bool:
+    """
+    Если пользователь ещё не исчерпал дневной лимит, зачтём сообщение и вернём True.
+    Иначе — False.
+    """
+    used = await get_usage_today(user_id)
+    if used >= limit:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO messages(user_id, created_at) VALUES (?, ?)",
+            (user_id, _utcnow_iso()),
+        )
+        await db.commit()
+        return True
+
+
+# ========= ПРЕМИУМ =========
+
+async def is_premium(user_id: int) -> bool:
+    """
+    Активен ли премиум сейчас.
+    """
+    now = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT expires_at FROM premiums WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return False
+        return row[0] > now  # сравнение ISO строк корректно для ISO-8601 UTC
+
+
+async def set_premium(user_id: int, expires_at_iso: str):
+    """
+    Выдаёт/продлевает премиум. Логируем событие для статистики.
+    """
+    now = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO premiums(user_id, expires_at, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              expires_at = excluded.expires_at,
+              updated_at = excluded.updated_at
+            """,
+            (user_id, expires_at_iso, now),
+        )
+        # событие покупки/активации
+        await db.execute(
+            "INSERT INTO premium_events(user_id, activated_at) VALUES (?, ?)",
+            (user_id, now),
+        )
+        await db.commit()
+
+
+# ========= СТАТИСТИКА ДЛЯ АДМИНКИ =========
+
+async def count_paid_users_today() -> int:
+    """
+    Сколько активаций премиума сегодня (по событиям).
+    """
+    day = _today_str()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT COUNT(*) FROM premium_events
+            WHERE substr(activated_at, 1, 10) = ?
+            """,
+            (day,),
+        )
+        n = (await cur.fetchone())[0]
+        await cur.close()
+        return int(n)
+
+
+async def count_paid_users_total() -> int:
+    """
+    Сколько пользователей сейчас имеют активный премиум.
+    """
+    now = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM premiums WHERE expires_at > ?",
+            (now,),
+        )
+        n = (await cur.fetchone())[0]
+        await cur.close()
+        return int(n)
