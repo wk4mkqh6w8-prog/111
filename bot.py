@@ -366,10 +366,6 @@ async def on_shutdown():
     _keepalive_stop.set()
     try:
         if application is not None:
-            try:
-                await application.bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                pass
             await application.stop()
             await application.shutdown()
     finally:
