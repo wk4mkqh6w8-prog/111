@@ -1,28 +1,20 @@
 import os
 import logging
-import asyncio
 import threading
 from datetime import datetime, timedelta
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import uvicorn
 
 from openai import OpenAI
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, ApplicationBuilder,
+    CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
 )
 
 # =========================
@@ -59,12 +51,11 @@ oai = OpenAI(api_key=OPENAI_KEY)
 # =========================
 # Импорт БД-хелперов
 # =========================
-# db.py должен содержать эти функции (см. присланную мной версию db.py)
 from db import (
     init_db,
     add_user,
     is_premium,
-    can_send_message,             # дневной лимит
+    can_send_message,
     set_premium,
     get_usage_today,
     get_free_credits,
@@ -107,7 +98,6 @@ def _ask_deepseek(prompt: str) -> str:
         with httpx.Client(timeout=30) as s:
             resp = s.post(url, headers=headers, json=payload)
             if resp.status_code != 200:
-                # покажем понятную ошибку (баланс/ключ/лимит и т.п.)
                 try:
                     err = resp.json()
                     msg = err.get("error", {}).get("message") or err.get("message") or str(err)
@@ -151,6 +141,16 @@ def models_keyboard() -> InlineKeyboardMarkup:
 # =========================
 REF_BONUS   = 25
 DAILY_LIMIT = 5  # базовый дневной лимит
+
+# =========================
+# Утилиты
+# =========================
+async def safe_answer(query, text: str | None = None, alert: bool = False):
+    """Безопасный ответ на callback_query (не падает на 400)."""
+    try:
+        await query.answer(text=text, show_alert=alert)
+    except Exception as e:
+        logger.debug("answerCallbackQuery failed: %s", e)
 
 # =========================
 # /start + рефералка
@@ -205,7 +205,7 @@ async def _render_profile_html(user_id: int) -> str:
         left_text = "∞ (Премиум)"
         status = "Премиум"
     else:
-        left_day = max(0, DAILEY_LIMIT - used_today) if 'DAILEY_LIMIT' in globals() else max(0, DAILY_LIMIT - used_today)
+        left_day = max(0, DAILY_LIMIT - used_today)
         total_left = left_day + bonus
         left_text = f"{total_left} (дневной лимит {left_day}, бонусов {bonus})"
         status = "Обычный"
@@ -213,7 +213,6 @@ async def _render_profile_html(user_id: int) -> str:
     me = await application.bot.get_me()
     deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
 
-    # HTML безопаснее Markdown для простого текста
     return (
         f"👤 <b>Профиль</b>\n"
         f"ID: <code>{user_id}</code>\n"
@@ -233,20 +232,15 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_profile_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    await safe_answer(q)
     try:
-        await q.answer()
         txt = await _render_profile_html(q.from_user.id)
         try:
             await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
         except Exception:
-            # если редактировать нельзя (старое сообщение) — отправим новое
             await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
     except Exception as e:
-        # покажем alert, чтобы пользователь увидел ошибку
-        try:
-            await q.answer(f"Ошибка профиля: {e}", show_alert=True)
-        except Exception:
-            pass
+        await safe_answer(q, f"Ошибка профиля: {e}", alert=True)
 
 # =========================
 # Реферальная программа
@@ -274,32 +268,22 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_ref_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    await safe_answer(q)
     try:
-        await q.answer()
         txt = await _render_referral_html(q.from_user.id)
         try:
             await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
         except Exception:
             await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
     except Exception as e:
-        try:
-            await q.answer(f"Ошибка: {e}", show_alert=True)
-        except Exception:
-            pass
+        await safe_answer(q, f"Ошибка: {e}", alert=True)
 
 # =========================
 # Выбор модели
 # =========================
-def models_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("OpenAI · GPT-4o-mini", callback_data="m:oai")],
-        [InlineKeyboardButton("DeepSeek · Chat",     callback_data="m:ds")],
-        [InlineKeyboardButton("⬅️ Назад",            callback_data="home")],
-    ])
-
 async def on_models_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
     try:
         await q.message.edit_text("Выбери модель:", reply_markup=models_keyboard())
     except Exception:
@@ -307,7 +291,7 @@ async def on_models_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_model_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
     if q.data == "m:oai":
         _user_model[q.from_user.id] = MODEL_OPENAI
         msg = "✅ Модель установлена: OpenAI · GPT-4o-mini"
@@ -321,12 +305,20 @@ async def on_model_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await q.message.reply_text(msg, reply_markup=main_keyboard())
 
+async def on_home_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
+    try:
+        await q.message.edit_text("Главное меню:", reply_markup=main_keyboard())
+    except Exception:
+        await q.message.reply_text("Главное меню:", reply_markup=main_keyboard())
+
 # =========================
 # Оплата (CryptoPay)
 # =========================
 async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
 
     if not CRYPTOPAY_KEY:
         await q.message.reply_text("💳 Оплата не подключена (нет CRYPTOPAY_KEY).")
@@ -349,6 +341,7 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = j["result"]["pay_url"]
         await q.message.reply_text(f"💳 Оплати подписку по ссылке:\n{url}")
     except Exception as e:
+        logger.exception("buy_btn error")
         await q.message.reply_text(f"❌ Не удалось создать счёт: {e}")
 
 # =========================
@@ -358,30 +351,31 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
 
-    # премиум — без ограничений
-    if await is_premium(user_id):
-        reply = ask_llm(user_id, text)
-        await update.message.reply_text(reply)
-        return
+    try:
+        if await is_premium(user_id):
+            reply = ask_llm(user_id, text)
+            await update.message.reply_text(reply)
+            return
 
-    # сначала дневной лимит
-    if await can_send_message(user_id, limit=DAILY_LIMIT):
-        reply = ask_llm(user_id, text)
-        await update.message.reply_text(reply)
-        return
+        if await can_send_message(user_id, limit=DAILY_LIMIT):
+            reply = ask_llm(user_id, text)
+            await update.message.reply_text(reply)
+            return
 
-    # затем бонусные кредиты
-    if await consume_free_credit(user_id):
-        reply = ask_llm(user_id, text)
-        await update.message.reply_text(reply)
-        return
+        if await consume_free_credit(user_id):
+            reply = ask_llm(user_id, text)
+            await update.message.reply_text(reply)
+            return
 
-    await update.message.reply_text(
-        "🚫 Лимит исчерпан.\n"
-        f"— Дневной лимит: {DAILY_LIMIT}/день\n"
-        f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
-        "Купите подписку «💳 Купить подписку» для безлимита."
-    )
+        await update.message.reply_text(
+            "🚫 Лимит исчерпан.\n"
+            f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+            f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
+            "Купите подписку «💳 Купить подписку» для безлимита."
+        )
+    except Exception as e:
+        logger.exception("on_message error")
+        await update.message.reply_text(f"⚠️ Временная ошибка: {e}")
 
 # =========================
 # Админка
@@ -399,6 +393,17 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
+# PTB error handler (важно!)
+# =========================
+async def tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error in handler", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.callback_query:
+            await safe_answer(update.callback_query, "⚠️ Ошибка. Попробуйте ещё раз.", alert=False)
+    except Exception:
+        pass
+
+# =========================
 # Webhooks
 # =========================
 @app.post("/tg")
@@ -406,10 +411,15 @@ async def telegram_webhook(request: Request):
     global application
     if application is None:
         return {"ok": False, "error": "bot not initialized"}
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return {"ok": True}
+    except Exception:
+        logger.exception("/tg processing error")
+        # Отвечаем 200/ok, чтобы процесс не считался упавшим
+        return {"ok": True, "note": "error was handled"}
 
 @app.post("/cryptopay-webhook")
 async def cryptopay_webhook(request: Request):
@@ -431,15 +441,24 @@ async def cryptopay_webhook(request: Request):
 
         if user_id:
             expires_at = (datetime.now() + timedelta(days=30)).isoformat()
-            await set_premium(user_id, expires_at)
+            try:
+                await set_premium(user_id, expires_at)
+            except Exception:
+                logger.exception("set_premium failed")
+
             try:
                 await application.bot.send_message(
                     chat_id=user_id,
                     text="✅ Оплата получена! Подписка активирована на 30 дней."
                 )
             except Exception:
-                pass
+                logger.exception("notify user after payment failed")
     return {"ok": True}
+
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled FastAPI error")
+    return JSONResponse(status_code=200, content={"ok": True, "err": "handled"})
 
 @app.get("/health")
 async def health():
@@ -453,10 +472,10 @@ def _keepalive_loop():
         return
     url = f"{_public_url.rstrip('/')}/health"
     session = requests.Session()
-    # каждые ~40 сек
-    while not _keepalive_stop.wait(40):
+    while not _keepalive_stop.wait(40):  # ~40 секунд
         try:
             session.get(url, timeout=8)
+            logger.debug("keep-alive ping %s", url)
         except Exception:
             pass
 
@@ -476,12 +495,11 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_ref_btn,      pattern=r"^ref$"))
     app_.add_handler(CallbackQueryHandler(on_models_btn,   pattern=r"^models$"))
     app_.add_handler(CallbackQueryHandler(on_model_select, pattern=r"^m:(oai|ds)$"))
-    app_.add_handler(CallbackQueryHandler(
-        lambda u, c: u.callback_query.message.edit_text("Главное меню:", reply_markup=main_keyboard()),
-        pattern=r"^home$"
-    ))
+    app_.add_handler(CallbackQueryHandler(on_home_btn,     pattern=r"^home$"))
     # сообщения
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # глобальный обработчик ошибок
+    app_.add_error_handler(tg_error_handler)
     return app_
 
 @app.on_event("startup")
