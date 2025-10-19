@@ -233,11 +233,11 @@ async def _render_referral_html(user_id: int) -> str:
     deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
     return (
         "🎁 <b>Реферальная программа</b>\n\n"
-        f"Приглашайте друзей по ссылке и получайте <b>+{REF_BONUS}</b> бесплатных заявок за каждого!\n\n"
+        f"Приглашайте друзей по ссылке и получайте <b>+{REF_BОНУС}</b> бесплатных заявок за каждого!\n\n"
         f"🔗 Ваша ссылка:\n{deep_link}\n\n"
         "Как это работает:\n"
         "• Человек нажимает по ссылке и жмёт /start\n"
-        f"• Вам автоматически начисляется <b>+{REF_BONUS}</b> заявок\n"
+        f"• Вам автоматически начисляется <b>+{REF_BОНУС}</b> заявок\n"
         "• Бонусы суммируются и расходуются после дневного лимита\n"
     )
 
@@ -358,7 +358,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚫 Лимит исчерпан.\n"
         f"— Дневной лимит: {DAILY_LIMIT}/день\n"
-        f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
+        f"— Реферальные бонусы: получите +{REF_BОНУС} заявок за каждого приглашённого!\n\n"
         "Купите подписку «💳 Купить подписку» для безлимита."
     )
 
@@ -444,32 +444,61 @@ async def telegram_webhook(request: Request):
 
 @app.post("/cryptopay-webhook")
 async def cryptopay_webhook(request: Request):
+    """
+    Обработчик вебхуков Crypto Pay.
+    Поддерживает актуальный формат (update_type=invoice_paid, данные в data['payload'])
+    и старый формат (data['invoice']).
+    """
     global application
     try:
         data = await request.json()
     except Exception:
         return {"ok": False, "error": "bad json"}
 
-    invoice = data.get("invoice") or {}
-    status  = invoice.get("status")
-    payload = invoice.get("payload")
+    try:
+        # Лёгкий лог на время отладки (можно отключить позже)
+        logger.info("CryptoPay webhook: %s", data)
+    except Exception:
+        pass
 
-    if status == "paid" and payload:
-        try:
-            user_id = int(payload)
-        except Exception:
-            user_id = None
+    user_id = None
+    paid = False
 
-        if user_id:
-            expires_at = (datetime.now() + timedelta(days=30)).isoformat()
-            await set_premium(user_id, expires_at)
+    # Новый/актуальный формат от Crypto Pay
+    update_type = data.get("update_type")
+    inv_new = data.get("payload") or {}
+    if update_type == "invoice_paid" and isinstance(inv_new, dict):
+        raw_uid = inv_new.get("payload")
+        if raw_uid is not None:
             try:
-                await application.bot.send_message(
-                    chat_id=user_id,
-                    text="✅ Оплата получена! Подписка активирована на 30 дней."
-                )
+                user_id = int(str(raw_uid))
+                paid = True
             except Exception:
-                pass
+                user_id = None
+
+    # Совместимость со старым форматом (если когда-то включали другой webhook)
+    if not paid:
+        invoice = data.get("invoice") or {}
+        status = invoice.get("status")
+        raw_uid = invoice.get("payload")
+        if status == "paid" and raw_uid is not None:
+            try:
+                user_id = int(str(raw_uid))
+                paid = True
+            except Exception:
+                user_id = None
+
+    if paid and user_id:
+        expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+        await set_premium(user_id, expires_at)
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text="✅ Оплата получена! Подписка активирована на 30 дней."
+            )
+        except Exception:
+            pass
+
     return {"ok": True}
 
 @app.get("/health")
@@ -492,13 +521,13 @@ def _keepalive_loop():
 
 async def _webhook_guard_loop():
     """
-    Раз в 10 минут проверяем webhook и чинем, если он слетел.
+    Раз в 10 минут проверяем webhook и чиним, если он слетел.
     """
     await asyncio.sleep(8)
     while True:
         try:
             bot = application.bot
-            me = await bot.get_me()
+            _ = await bot.get_me()
             info = await bot.get_webhook_info()
             needed = f"{_public_url.rstrip('/')}/tg"
             if info.url != needed:
