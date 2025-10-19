@@ -24,8 +24,8 @@ load_dotenv()
 
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
 OPENAI_KEY    = os.getenv("OPENAI_KEY", "")
-CRYPTOPAY_KEY = os.getenv("CRYPTOPAY_KEY")  # опционально
-DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY", "")  # опционально
+CRYPTOPAY_KEY = os.getenv("CRYPTOPAY_KEY")          # опционально (для оплаты)
+DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY", "")       # опционально (для DeepSeek)
 PORT          = int(os.getenv("PORT", "10000"))
 ADMIN_ID      = int(os.getenv("ADMIN_ID", "0") or 0)
 
@@ -87,19 +87,53 @@ def ask_openai(model_name: str, prompt: str) -> str:
 def ask_deepseek(model_name: str, prompt: str) -> str:
     if not DEEPSEEK_KEY:
         return "DeepSeek недоступен: не задан DEEPSEEK_KEY."
+
     try:
         r = requests.post(
             "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_KEY}"},
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_KEY}",
+                "Content-Type": "application/json",
+            },
             json={
-                "model": model_name,
+                "model": model_name,  # "deepseek-chat"
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.7,
             },
             timeout=30,
         )
+
+        # HTTP-ошибка (401, 403, 429, 5xx и т.д.)
+        if r.status_code != 200:
+            try:
+                err_json = r.json()
+                msg = err_json.get("error", {}).get("message") or err_json.get("message") or str(err_json)
+            except Exception:
+                msg = r.text[:400]
+            return f"DeepSeek API error {r.status_code}: {msg}"
+
         j = r.json()
-        return j["choices"][0]["message"]["content"]
+
+        # нормальный ответ: choices[0].message.content (или .text как запасной вариант)
+        if isinstance(j, dict) and "choices" in j and j["choices"]:
+            choice = j["choices"][0]
+            if isinstance(choice, dict):
+                msg = choice.get("message") or {}
+                content = msg.get("content")
+                if content:
+                    return content
+                text = choice.get("text")
+                if text:
+                    return text
+
+        # ошибка внутри JSON
+        if isinstance(j, dict) and "error" in j:
+            e = j["error"]
+            return f"DeepSeek error: {e.get('message', str(e))}"
+
+        # непредвиденный формат
+        return f"DeepSeek: unexpected response: {str(j)[:400]}"
+
     except Exception as e:
         return f"Ошибка DeepSeek: {e}"
 
@@ -124,8 +158,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb,
     )
 
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(f"Ваш Telegram ID: {uid}\nADMIN_ID в боте: {ADMIN_ID}")
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
+        await update.message.reply_text("⛔ Нет доступа. Установите ADMIN_ID или используйте свой админ-аккаунт.")
         return
     lines = ["🛡 Админ-панель"]
     try:
@@ -147,6 +186,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
+        await update.message.reply_text("⛔ Нет доступа.")
         return
     totals = await get_totals()
     today = await get_stats_today()
@@ -159,6 +199,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_grant_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
+        await update.message.reply_text("⛔ Нет доступа.")
         return
     args = context.args
     if not args:
@@ -176,6 +217,7 @@ async def cmd_grant_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_revoke_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
+        await update.message.reply_text("⛔ Нет доступа.")
         return
     args = context.args
     if not args:
@@ -235,7 +277,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
 
-    # узнаем выбранную модель
+    # модель пользователя
     code = await get_model(user_id)
     meta = MODELS.get(code, MODELS["openai:gpt-4o-mini"])
     provider, model_name = meta["provider"], meta["model"]
@@ -363,6 +405,7 @@ def _keepalive_loop():
 def build_application() -> Application:
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
     app_.add_handler(CommandHandler("start",  cmd_start))
+    app_.add_handler(CommandHandler("whoami", cmd_whoami))
     app_.add_handler(CommandHandler("admin",  cmd_admin))
     app_.add_handler(CommandHandler("stats",  cmd_stats))
     app_.add_handler(CommandHandler("grant_premium",  cmd_grant_premium))
