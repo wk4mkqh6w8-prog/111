@@ -1,7 +1,8 @@
 import os
 import logging
+import asyncio
+import threading
 from datetime import datetime, timedelta
-from threading import Thread
 
 import requests
 from dotenv import load_dotenv
@@ -9,15 +10,11 @@ from fastapi import FastAPI, Request
 import uvicorn
 
 from openai import OpenAI
-
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, ApplicationBuilder,
+    CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
 )
 
 # --------------------
@@ -25,87 +22,35 @@ from telegram.ext import (
 # --------------------
 load_dotenv()
 
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
-OPENAI_KEY     = os.getenv("OPENAI_KEY", "")
-CRYPTOPAY_KEY  = os.getenv("CRYPTOPAY_KEY")  # может быть None (пока не добавили)
-PORT           = int(os.getenv("PORT", "10000"))
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OPENAI_KEY = os.getenv("OPENAI_KEY", "")
+CRYPTOPAY_KEY = os.getenv("CRYPTOPAY_KEY")  # может быть None
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN пуст. Добавь его в .env")
+    raise RuntimeError("BOT_TOKEN пуст. Добавь его в переменные окружения.")
 if not OPENAI_KEY:
-    raise RuntimeError("OPENAI_KEY пуст. Добавь его в .env")
+    raise RuntimeError("OPENAI_KEY пуст. Добавь его в переменные окружения.")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("neurobot")
 
 client = OpenAI(api_key=OPENAI_KEY)
 
 # БД-утилиты
 from db import init_db, add_user, is_premium, can_send_message, set_premium  # noqa: E402
 
-# --------------------
-# FastAPI (webhook для CryptoPay)
-# --------------------
+# ============================================================================
+# FastAPI + Telegram Application (webhook-only)
+# ============================================================================
 app = FastAPI(title="NeuroBot API")
-# === Webhook для Telegram ===
-@app.post("/tg")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
+application: Application | None = None  # глобальная ссылка на PTB-приложение
+_public_url: str | None = None
+_keepalive_stop = threading.Event()
 
-@app.post("/cryptopay-webhook")
-async def cryptopay_webhook(request: Request):
-    """
-    Ожидает JSON от CryptoPay вида:
-    {
-      "update_id": ...,
-      "invoice": {
-        "status": "paid",
-        "payload": "<telegram_user_id>"
-      }
-    }
-    """
-    try:
-        data = await request.json()
-    except Exception:
-        return {"ok": False, "error": "bad json"}
 
-    invoice = data.get("invoice") or {}
-    status  = invoice.get("status")
-    payload = invoice.get("payload")
-
-    if status == "paid" and payload:
-        try:
-            user_id = int(payload)
-        except Exception:
-            user_id = None
-
-        if user_id:
-            expires_at = (datetime.now() + timedelta(days=30)).isoformat()
-            await set_premium(user_id, expires_at)
-            # отправим пользователю уведомление о премиуме
-            try:
-                await application.bot.send_message(
-                    chat_id=user_id,
-                    text="✅ Оплата получена! Подписка активирована на 30 дней."
-                )
-            except Exception:
-                pass
-
-    return {"ok": True}
-
-def run_fastapi():
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
-
-# --------------------
-# Вспомогательные функции
-# --------------------
+# ---------- GPT ----------
 def ask_gpt(prompt: str) -> str:
-    """
-    Вызов OpenAI (модель можно поменять при желании).
-    """
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -113,24 +58,24 @@ def ask_gpt(prompt: str) -> str:
     )
     return resp.choices[0].message.content
 
-# --------------------
-# Хэндлеры Telegram
-# --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# ---------- Хэндлеры бота ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await add_user(user.id)
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Выбрать нейросеть (пока GPT-4o-mini)", callback_data="neuro")],
-        [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")]
+        [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
     ])
     await update.message.reply_text(
         "Привет! Я нейробот 🤖\n\n"
         "Бесплатно: 5 сообщений в день.\n"
         "Премиум — без ограничений и очередей.\n\n"
         "Выбирай действие ниже:",
-        reply_markup=kb
+        reply_markup=kb,
     )
+
 
 async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -138,7 +83,7 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not CRYPTOPAY_KEY:
         await query.message.reply_text(
-            "💳 Оплата ещё не подключена. Добавь CRYPTOPAY_KEY в .env — и я выдам ссылку на оплату."
+            "💳 Оплата ещё не подключена. Добавь CRYPTOPAY_KEY в переменные окружения."
         )
         return
 
@@ -148,26 +93,31 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "asset": "USDT",
         "amount": "3",
         "description": "Подписка на 30 дней",
-        "payload": payload
+        "payload": payload,
     }
     try:
-        r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
+        r = requests.post(
+            "https://pay.crypt.bot/api/createInvoice",
+            json=data, headers=headers, timeout=15,
+        )
         j = r.json()
         url = j["result"]["pay_url"]
         await query.message.reply_text(f"💳 Оплати подписку по ссылке:\n{url}")
     except Exception as e:
         await query.message.reply_text(f"❌ Не удалось создать счёт: {e}")
 
+
 async def on_neuro_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("Пока доступна только GPT-4o-mini. Выбор других моделей добавим позже 🔧")
+    await query.message.reply_text("Пока доступна только GPT-4o-mini. Другие модели добавим позже 🔧")
+
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
 
-    # Премиум-пользователь — без ограничений
+    # Премиум — без ограничений
     if await is_premium(user_id):
         try:
             reply = ask_gpt(text)
@@ -189,64 +139,143 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Купи подписку через кнопку «💳 Купить подписку», чтобы снять ограничения."
         )
 
-# --------------------
-# Инициализация PTB
-# --------------------
-async def _startup(app):
-    # Инициализируем БД и поднимем FastAPI в фоне
-    await init_db()
-    Thread(target=run_fastapi, daemon=True).start()
-    logger.info("✅ База готова и FastAPI запущен на порту %s", PORT)
 
-import asyncio  # добавь вверху, если его ещё нет
-
-def main():
+# ---------- Webhook-эндоинты ----------
+@app.post("/tg")
+async def telegram_webhook(request: Request):
+    """
+    Принимаем апдейты от Telegram и прокидываем в PTB.
+    """
     global application
+    if application is None:
+        return {"ok": False, "error": "bot not initialized"}
 
-    # 🩵 Фикс для Python 3.14: создаём event loop вручную
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return {"ok": True}
+
+
+@app.post("/cryptopay-webhook")
+async def cryptopay_webhook(request: Request):
+    """
+    Принимаем уведомления от CryptoBot:
+    {
+      "invoice": {"status": "paid", "payload": "<telegram_user_id>"}
+    }
+    """
+    global application
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "bad json"}
 
-    application = ApplicationBuilder() \
-        .token(BOT_TOKEN) \
-        .post_init(_startup) \
-        .build()
+    invoice = data.get("invoice") or {}
+    status = invoice.get("status")
+    payload = invoice.get("payload")
 
-    # Команды
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(on_buy_btn,  pattern="^buy$"))
-    application.add_handler(CallbackQueryHandler(on_neuro_btn, pattern="^neuro$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    if status == "paid" and payload:
+        try:
+            user_id = int(payload)
+        except Exception:
+            user_id = None
 
-    # === Запуск с webhook (Render) ===
-import asyncio
-import uvicorn
+        if user_id:
+            expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+            await set_premium(user_id, expires_at)
+            # уведомление пользователю
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Оплата получена! Подписка активирована на 30 дней.",
+                )
+            except Exception:
+                pass
 
-async def init_bot_and_webhook():
-    global application
+    return {"ok": True}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+
+# ---------- Keep-alive пинг ----------
+def _keepalive_loop():
+    """
+    Фоновый поток: раз в 9 минут дергает /health, чтобы держать соединения теплыми,
+    пока инстанс активен. (На бесплатном плане Render всё равно может уснуть при простое.)
+    """
+    if not _public_url:
+        return
+    url = f"{_public_url.rstrip('/')}/health"
+    session = requests.Session()
+    while not _keepalive_stop.wait(540):  # 9 минут
+        try:
+            session.get(url, timeout=8)
+            logger.debug("keep-alive ping %s", url)
+        except Exception:
+            pass
+
+
+# ---------- Жизненный цикл FastAPI ----------
+def build_application() -> Application:
+    app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_.add_handler(CommandHandler("start", cmd_start))
+    app_.add_handler(CallbackQueryHandler(on_buy_btn, pattern=r"^buy$"))
+    app_.add_handler(CallbackQueryHandler(on_neuro_btn, pattern=r"^neuro$"))
+    app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    return app_
+
+
+@app.on_event("startup")
+async def on_startup():
+    global application, _public_url
+
+    # 1) DB
+    await init_db()
+
+    # 2) Telegram Application
+    application = build_application()
     await application.initialize()
     await application.start()
 
-    public_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
-    if not public_url:
-        raise RuntimeError(
-            "❌ Не найден PUBLIC_URL. На Render он задаётся автоматически. "
-            "Локально можно задать вручную."
-        )
+    # 3) Webhook
+    _public_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
+    if not _public_url:
+        # на Render RENDER_EXTERNAL_URL подставляется автоматически
+        raise RuntimeError("Не найден PUBLIC_URL/RENDER_EXTERNAL_URL")
 
-    webhook_url = f"{public_url}/tg"
+    webhook_url = f"{_public_url.rstrip('/')}/tg"
     await application.bot.set_webhook(webhook_url)
-    logger.info(f"✅ Установлен Telegram webhook: {webhook_url}")
+    logger.info("✅ Установлен Telegram webhook: %s", webhook_url)
 
+    # 4) Keep-alive
+    threading.Thread(target=_keepalive_loop, daemon=True).start()
+
+    logger.info("🚀 Startup complete. Listening on port %s", PORT)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    _keepalive_stop.set()
+    try:
+        if application is not None:
+            # Снять webhook не обязательно, но аккуратнее
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            await application.stop()
+            await application.shutdown()
+    finally:
+        logger.info("🛑 Shutdown complete")
+
+
+# ============================================================================
+# Запуск локально / на Render
+# ============================================================================
 if __name__ == "__main__":
-    import asyncio
-
-    async def main_async():
-        global application
-        application = ApplicationBuilder().token(BOT_TOKEN).build()
-        await init_bot_and_webhook()
-
-    asyncio.run(main_async())
+    # Для локального запуска можно указать PUBLIC_URL вручную.
+    # На Render просто используем Start Command:  python bot.py
     uvicorn.run(app, host="0.0.0.0", port=PORT)
