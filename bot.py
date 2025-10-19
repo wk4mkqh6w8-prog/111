@@ -32,8 +32,8 @@ load_dotenv()
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 OPENAI_KEY     = os.getenv("OPENAI_KEY", "")
-DEEPSEEK_KEY   = os.getenv("DEEPSEEK_KEY", "")  # опционально
-CRYPTOPAY_KEY  = os.getenv("CRYPTOPAY_KEY", "") # опционально
+DEEPSEEK_KEY   = os.getenv("DEEPSEEK_KEY", "")   # опционально
+CRYPTOPAY_KEY  = os.getenv("CRYPTOPAY_KEY", "")  # опционально
 ADMIN_ID       = int(os.getenv("ADMIN_ID", "0"))
 PORT           = int(os.getenv("PORT", "10000"))
 
@@ -42,40 +42,37 @@ if not BOT_TOKEN:
 if not OPENAI_KEY:
     raise RuntimeError("OPENAI_KEY пуст")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("neurobot")
 
 # Модели
-MODEL_OPENAI = "OpenAI · GPT-4o-mini"
+MODEL_OPENAI   = "OpenAI · GPT-4o-mini"
 MODEL_DEEPSEEK = "DeepSeek · Chat"
+DEFAULT_MODEL  = MODEL_OPENAI
 
-# по умолчанию
-DEFAULT_MODEL = MODEL_OPENAI
-
-# Глобально активная LLM на пользователя
-# (для простоты в память; можно вынести в БД, если нужно сохранять между рестартами)
+# Per-user выбранная модель (в памяти)
 _user_model: dict[int, str] = {}
 
-# OpenAI
+# OpenAI клиент
 oai = OpenAI(api_key=OPENAI_KEY)
 
 # =========================
 # Импорт БД-хелперов
 # =========================
-# Обновлённый db.py должен содержать нижеуказанные функции
+# db.py должен содержать эти функции (см. присланную мной версию db.py)
 from db import (
     init_db,
     add_user,
     is_premium,
-    can_send_message,             # лимит по дню (по умолчанию 5)
+    can_send_message,             # дневной лимит
     set_premium,
-    get_usage_today,              # -> int (сколько из дневного лимита уже использовано)
-    get_free_credits,             # -> int (бонусные кредиты, например от рефералок)
-    consume_free_credit,          # -> bool (списать 1 бонусный кредит, если есть)
-    add_free_credits,             # (user_id, n)
-    set_referrer_if_empty,        # (user_id, ref_id) -> bool (привязали впервые?)
-    count_paid_users_today,       # -> int (для админки)
-    count_paid_users_total,       # -> int (для админки)
+    get_usage_today,
+    get_free_credits,
+    consume_free_credit,
+    add_free_credits,
+    set_referrer_if_empty,
+    count_paid_users_today,
+    count_paid_users_total,
 )
 
 # =========================
@@ -97,10 +94,9 @@ def _ask_openai(prompt: str) -> str:
 
 def _ask_deepseek(prompt: str) -> str:
     if not DEEPSEEK_KEY:
-        return "DeepSeek API key не задан (DEEPSEEK_KEY)."
+        return "DeepSeek недоступен: не задан DEEPSEEK_KEY."
     try:
-        # простая совместимость формата (их REST):
-        import json, httpx
+        import httpx
         url = "https://api.deepseek.com/chat/completions"
         headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
         payload = {
@@ -110,14 +106,18 @@ def _ask_deepseek(prompt: str) -> str:
         }
         with httpx.Client(timeout=30) as s:
             resp = s.post(url, headers=headers, json=payload)
-            if resp.status_code == 402:
-                return "DeepSeek API error 402: Insufficient Balance"
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                # покажем понятную ошибку (баланс/ключ/лимит и т.п.)
+                try:
+                    err = resp.json()
+                    msg = err.get("error", {}).get("message") or err.get("message") or str(err)
+                except Exception:
+                    msg = resp.text[:400]
+                return f"DeepSeek API error {resp.status_code}: {msg}"
             data = resp.json()
-        # безопасный парсинг
         choice = (data or {}).get("choices", [{}])[0]
         msg = (choice or {}).get("message", {})
-        text = msg.get("content") or ""
+        text = msg.get("content") or (choice or {}).get("text") or ""
         return text or "DeepSeek вернул пустой ответ."
     except Exception as e:
         return f"Ошибка DeepSeek: {e!s}"
@@ -135,6 +135,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Выбрать модель", callback_data="models")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
     ])
 
@@ -146,16 +147,19 @@ def models_keyboard() -> InlineKeyboardMarkup:
     ])
 
 # =========================
+# Константы
+# =========================
+REF_BONUS   = 25
+DAILY_LIMIT = 5  # базовый дневной лимит
+
+# =========================
 # /start + рефералка
 # =========================
-REF_BONUS = 25
-DAILY_LIMIT = 5  # встроенный базовый дневной лимит
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await add_user(user.id)
 
-    # deep-link параметр
+    # deep-link параметр: /start ref_<tg_id>
     ref_id = None
     if context.args:
         arg = context.args[0]
@@ -165,7 +169,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 ref_id = None
 
-    # если есть реферер — запишем и начислим бонусы рефереру
+    # Привязка реферера и выдача бонусов рефереру
     if ref_id and ref_id != user.id:
         try:
             first_bind = await set_referrer_if_empty(user.id, ref_id)
@@ -192,62 +196,130 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # Профиль
 # =========================
-async def _render_profile_text(user_id: int) -> str:
+async def _render_profile_html(user_id: int) -> str:
     prem = await is_premium(user_id)
-    used_today = await get_usage_today(user_id)  # из дневного лимита
+    used_today = await get_usage_today(user_id)
     bonus = await get_free_credits(user_id)
+
     if prem:
         left_text = "∞ (Премиум)"
         status = "Премиум"
     else:
-        # осталось по дневному лимиту + бонусные кредиты
-        left_day = max(0, DAILY_LIMIT - used_today)
+        left_day = max(0, DAILEY_LIMIT - used_today) if 'DAILEY_LIMIT' in globals() else max(0, DAILY_LIMIT - used_today)
         total_left = left_day + bonus
-        left_text = f"{total_left} (из них дневной лимит {left_day}, бонусов {bonus})"
+        left_text = f"{total_left} (дневной лимит {left_day}, бонусов {bonus})"
         status = "Обычный"
-    # реф. ссылка
+
     me = await application.bot.get_me()
     deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
 
+    # HTML безопаснее Markdown для простого текста
     return (
-        f"👤 Профиль\n"
-        f"ID: `{user_id}`\n"
-        f"Статус: **{status}**\n"
-        f"Осталось заявок: **{left_text}**\n\n"
-        f"🔗 Реферальная ссылка:\n{deep_link}\n\n"
-        f"За каждого приглашенного: +{REF_BONUS} заявок."
+        f"👤 <b>Профиль</b>\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Осталось заявок: <b>{left_text}</b>\n\n"
+        f"🔗 <b>Ваша реферальная ссылка:</b>\n{deep_link}\n\n"
+        f"За каждого приглашённого: +{REF_BONUS} заявок."
     )
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    txt = await _render_profile_text(user_id)
-    await update.message.reply_markdown(txt)
+    try:
+        user_id = update.effective_user.id
+        txt = await _render_profile_html(user_id)
+        await update.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Профиль временно недоступен: {e}")
 
 async def on_profile_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    txt = await _render_profile_text(q.from_user.id)
-    await q.message.edit_text(txt, parse_mode="Markdown", reply_markup=main_keyboard())
+    try:
+        await q.answer()
+        txt = await _render_profile_html(q.from_user.id)
+        try:
+            await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+        except Exception:
+            # если редактировать нельзя (старое сообщение) — отправим новое
+            await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+    except Exception as e:
+        # покажем alert, чтобы пользователь увидел ошибку
+        try:
+            await q.answer(f"Ошибка профиля: {e}", show_alert=True)
+        except Exception:
+            pass
+
+# =========================
+# Реферальная программа
+# =========================
+async def _render_referral_html(user_id: int) -> str:
+    me = await application.bot.get_me()
+    deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
+    return (
+        "🎁 <b>Реферальная программа</b>\n\n"
+        f"Приглашайте друзей по ссылке и получайте <b>+{REF_BONUS}</b> бесплатных заявок за каждого!\n\n"
+        f"🔗 Ваша ссылка:\n{deep_link}\n\n"
+        "Как это работает:\n"
+        "• Человек нажимает по ссылке и жмёт /start\n"
+        f"• Вам автоматически начисляется <b>+{REF_BONUS}</b> заявок\n"
+        "• Бонусы суммируются и расходуются, когда исчерпан дневной лимит\n"
+    )
+
+async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        txt = await _render_referral_html(user_id)
+        await update.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Раздел временно недоступен: {e}")
+
+async def on_ref_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+        txt = await _render_referral_html(q.from_user.id)
+        try:
+            await q.message.edit_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+        except Exception:
+            await q.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+    except Exception as e:
+        try:
+            await q.answer(f"Ошибка: {e}", show_alert=True)
+        except Exception:
+            pass
 
 # =========================
 # Выбор модели
 # =========================
+def models_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("OpenAI · GPT-4o-mini", callback_data="m:oai")],
+        [InlineKeyboardButton("DeepSeek · Chat",     callback_data="m:ds")],
+        [InlineKeyboardButton("⬅️ Назад",            callback_data="home")],
+    ])
+
 async def on_models_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.edit_text("Выбери модель:", reply_markup=models_keyboard())
+    try:
+        await q.message.edit_text("Выбери модель:", reply_markup=models_keyboard())
+    except Exception:
+        await q.message.reply_text("Выбери модель:", reply_markup=models_keyboard())
 
 async def on_model_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if q.data == "m:oai":
         _user_model[q.from_user.id] = MODEL_OPENAI
-        await q.message.edit_text("✅ Модель установлена: OpenAI · GPT-4o-mini", reply_markup=main_keyboard())
+        msg = "✅ Модель установлена: OpenAI · GPT-4o-mini"
     elif q.data == "m:ds":
         _user_model[q.from_user.id] = MODEL_DEEPSEEK
-        await q.message.edit_text("✅ Модель установлена: DeepSeek · Chat", reply_markup=main_keyboard())
+        msg = "✅ Модель установлена: DeepSeek · Chat"
     else:
-        await q.message.edit_text("Неизвестная модель.", reply_markup=main_keyboard())
+        msg = "Неизвестная модель."
+    try:
+        await q.message.edit_text(msg, reply_markup=main_keyboard())
+    except Exception:
+        await q.message.reply_text(msg, reply_markup=main_keyboard())
 
 # =========================
 # Оплата (CryptoPay)
@@ -292,19 +364,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
-    # сначала пробуем дневной лимит
+    # сначала дневной лимит
     if await can_send_message(user_id, limit=DAILY_LIMIT):
         reply = ask_llm(user_id, text)
         await update.message.reply_text(reply)
         return
 
-    # если дневной лимит исчерпан — пробуем бонусные кредиты
+    # затем бонусные кредиты
     if await consume_free_credit(user_id):
         reply = ask_llm(user_id, text)
         await update.message.reply_text(reply)
         return
 
-    # нет лимита и бонусов
     await update.message.reply_text(
         "🚫 Лимит исчерпан.\n"
         f"— Дневной лимит: {DAILY_LIMIT}/день\n"
@@ -313,7 +384,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
-# Админка (короткая)
+# Админка
 # =========================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -394,26 +465,29 @@ def _keepalive_loop():
 # =========================
 def build_application() -> Application:
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-    app_.add_handler(CommandHandler("start", cmd_start))
+    # команды
+    app_.add_handler(CommandHandler("start",   cmd_start))
     app_.add_handler(CommandHandler("profile", cmd_profile))
-    app_.add_handler(CommandHandler("admin", cmd_admin))
-
+    app_.add_handler(CommandHandler("ref",     cmd_ref))
+    app_.add_handler(CommandHandler("admin",   cmd_admin))
+    # кнопки
     app_.add_handler(CallbackQueryHandler(on_buy_btn,      pattern=r"^buy$"))
     app_.add_handler(CallbackQueryHandler(on_profile_btn,  pattern=r"^profile$"))
+    app_.add_handler(CallbackQueryHandler(on_ref_btn,      pattern=r"^ref$"))
     app_.add_handler(CallbackQueryHandler(on_models_btn,   pattern=r"^models$"))
     app_.add_handler(CallbackQueryHandler(on_model_select, pattern=r"^m:(oai|ds)$"))
-    app_.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.message.edit_text(
-        "Главное меню:", reply_markup=main_keyboard()), pattern=r"^home$"))
-
+    app_.add_handler(CallbackQueryHandler(
+        lambda u, c: u.callback_query.message.edit_text("Главное меню:", reply_markup=main_keyboard()),
+        pattern=r"^home$"
+    ))
+    # сообщения
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app_
 
 @app.on_event("startup")
 async def on_startup():
     global application, _public_url
-
     await init_db()
-
     application = build_application()
     await application.initialize()
     await application.start()
