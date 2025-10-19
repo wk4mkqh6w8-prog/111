@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 import threading
 from datetime import datetime, timedelta
 
@@ -17,9 +16,9 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
-# --------------------
+# ===============================
 # Настройки и клиенты
-# --------------------
+# ===============================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -27,10 +26,14 @@ OPENAI_KEY = os.getenv("OPENAI_KEY", "")
 CRYPTOPAY_KEY = os.getenv("CRYPTOPAY_KEY")  # может быть None
 PORT = int(os.getenv("PORT", "10000"))
 
+# Администраторы бота: "123456789,987654321"
+ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = {int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdigit()}
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN пуст. Добавь его в переменные окружения.")
+    raise RuntimeError("BOT_TOKEN пуст. Добавь его в переменные окружения Render.")
 if not OPENAI_KEY:
-    raise RuntimeError("OPENAI_KEY пуст. Добавь его в переменные окружения.")
+    raise RuntimeError("OPENAI_KEY пуст. Добавь его в переменные окружения Render.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("neurobot")
@@ -38,18 +41,24 @@ logger = logging.getLogger("neurobot")
 client = OpenAI(api_key=OPENAI_KEY)
 
 # БД-утилиты
-from db import init_db, add_user, is_premium, can_send_message, set_premium  # noqa: E402
+from db import (  # noqa: E402
+    init_db, add_user, is_premium, can_send_message, set_premium,
+    set_premium_days, remove_premium, get_user, stats,
+    log_payment, sales_summary, daily_breakdown
+)
 
 # ============================================================================
 # FastAPI + Telegram Application (webhook-only)
 # ============================================================================
 app = FastAPI(title="NeuroBot API")
-application: Application | None = None  # глобальная ссылка на PTB-приложение
+application: Application | None = None
 _public_url: str | None = None
 _keepalive_stop = threading.Event()
 
 
-# ---------- GPT ----------
+# ===============================
+# GPT
+# ===============================
 def ask_gpt(prompt: str) -> str:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -59,7 +68,9 @@ def ask_gpt(prompt: str) -> str:
     return resp.choices[0].message.content
 
 
-# ---------- Хэндлеры бота ----------
+# ===============================
+# Хэндлеры пользователя
+# ===============================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await add_user(user.id)
@@ -83,7 +94,7 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not CRYPTOPAY_KEY:
         await query.message.reply_text(
-            "💳 Оплата ещё не подключена. Добавь CRYPTOPAY_KEY в переменные окружения."
+            "💳 Оплата ещё не подключена. Добавь CRYPTOPAY_KEY в переменные окружения Render."
         )
         return
 
@@ -102,7 +113,11 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         j = r.json()
         url = j["result"]["pay_url"]
-        await query.message.reply_text(f"💳 Оплати подписку по ссылке:\n{url}")
+        await query.message.reply_text(
+            "💳 Оплати подписку по ссылке:\n"
+            f"{url}\n\n"
+            "После оплаты доступ откроется автоматически ✅"
+        )
     except Exception as e:
         await query.message.reply_text(f"❌ Не удалось создать счёт: {e}")
 
@@ -140,7 +155,112 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ---------- Webhook-эндоинты ----------
+# ===============================
+# Админ-панель
+# ===============================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+ADMIN_HELP = (
+    "🔐 Админ-панель:\n"
+    "/whoami — показать твой id\n"
+    "/stats — пользователи и покупки за сегодня\n"
+    "/sales — продажи: сегодня / 7 дней / всего + разбивка по дням\n"
+    "/status <tg_id> — статус пользователя\n"
+    "/grant <tg_id> [дней] — выдать премиум (по умолчанию 30)\n"
+    "/revoke <tg_id> — снять премиум\n"
+)
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🆔 Ваш Telegram ID: {update.effective_user.id}")
+
+
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ Нет доступа.")
+    await update.message.reply_text(ADMIN_HELP)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ Нет доступа.")
+    s = await stats()
+    await update.message.reply_text(
+        "📊 Статистика за сегодня:\n"
+        f"• Пользователей всего: {s['total']}\n"
+        f"• С премиумом: {s['premium']}\n"
+        f"• Активных сегодня: {s['active_today']}\n"
+        f"• Покупок сегодня: {s['purchases_today']}"
+    )
+
+
+async def cmd_sales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ Нет доступа.")
+    s = await sales_summary()
+    days = await daily_breakdown(days=7)
+    hist = "\n".join([f"• {d}: {c}" for d, c in days])
+    await update.message.reply_text(
+        "💳 Продажи:\n"
+        f"• Сегодня: {s['today']}\n"
+        f"• За 7 дней: {s['week']}\n"
+        f"• Всего: {s['total']}\n\n"
+        f"📅 По дням (последние 7):\n{hist}"
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ Нет доступа.")
+    if not context.args:
+        return await update.message.reply_text("Использование: /status <tg_id>")
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        return await update.message.reply_text("tg_id должен быть числом.")
+    u = await get_user(uid)
+    if not u:
+        return await update.message.reply_text("Пользователь не найден.")
+    _, premium_until, messages_today, last_date = u
+    await update.message.reply_text(
+        "👤 Пользователь: {uid}\nПремиум до: {pu}\nСообщений сегодня: {m}\nПоследняя дата: {d}".format(
+            uid=uid, pu=premium_until or "—", m=messages_today or 0, d=last_date or "—"
+        )
+    )
+
+
+async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ Нет доступа.")
+    if not context.args:
+        return await update.message.reply_text("Использование: /grant <tg_id> [дней]")
+    try:
+        uid = int(context.args[0])
+        days = int(context.args[1]) if len(context.args) > 1 else 30
+    except Exception:
+        return await update.message.reply_text("tg_id и дни должны быть числами.")
+    await set_premium_days(uid, days)
+    await update.message.reply_text(f"✅ Выдан премиум на {days} дн. пользователю {uid}")
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ Нет доступа.")
+    if not context.args:
+        return await update.message.reply_text("Использование: /revoke <tg_id>")
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        return await update.message.reply_text("tg_id должен быть числом.")
+    await remove_premium(uid)
+    await update.message.reply_text(f"✅ Премиум снят у {uid}")
+
+
+# ===============================
+# Webhook-эндоинты
+# ===============================
 @app.post("/tg")
 async def telegram_webhook(request: Request):
     """
@@ -161,7 +281,12 @@ async def cryptopay_webhook(request: Request):
     """
     Принимаем уведомления от CryptoBot:
     {
-      "invoice": {"status": "paid", "payload": "<telegram_user_id>"}
+      "invoice": {
+         "status": "paid",
+         "payload": "<telegram_user_id>",
+         "amount": "3",
+         "asset": "USDT"
+      }
     }
     """
     global application
@@ -174,6 +299,15 @@ async def cryptopay_webhook(request: Request):
     status = invoice.get("status")
     payload = invoice.get("payload")
 
+    # пробуем извлечь сумму/валюту (если есть)
+    amount = None
+    try:
+        if "amount" in invoice and invoice["amount"] is not None:
+            amount = float(invoice["amount"])
+    except Exception:
+        amount = None
+    asset = invoice.get("asset")
+
     if status == "paid" and payload:
         try:
             user_id = int(payload)
@@ -181,9 +315,17 @@ async def cryptopay_webhook(request: Request):
             user_id = None
 
         if user_id:
+            # логируем оплату
+            try:
+                await log_payment(user_id, amount, asset)
+            except Exception:
+                pass
+
+            # выдаём премиум на 30 дней
             expires_at = (datetime.now() + timedelta(days=30)).isoformat()
             await set_premium(user_id, expires_at)
-            # уведомление пользователю
+
+            # уведомляем пользователя
             try:
                 await application.bot.send_message(
                     chat_id=user_id,
@@ -200,11 +342,13 @@ async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 
-# ---------- Keep-alive пинг ----------
+# ===============================
+# Keep-alive пинг
+# ===============================
 def _keepalive_loop():
     """
     Фоновый поток: раз в 9 минут дергает /health, чтобы держать соединения теплыми,
-    пока инстанс активен. (На бесплатном плане Render всё равно может уснуть при простое.)
+    пока инстанс активен (на Free Render всё равно может уснуть при длительном простое).
     """
     if not _public_url:
         return
@@ -218,13 +362,27 @@ def _keepalive_loop():
             pass
 
 
-# ---------- Жизненный цикл FastAPI ----------
+# ===============================
+# Жизненный цикл FastAPI
+# ===============================
 def build_application() -> Application:
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Пользовательские
     app_.add_handler(CommandHandler("start", cmd_start))
     app_.add_handler(CallbackQueryHandler(on_buy_btn, pattern=r"^buy$"))
     app_.add_handler(CallbackQueryHandler(on_neuro_btn, pattern=r"^neuro$"))
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    # Админские
+    app_.add_handler(CommandHandler("whoami", whoami))
+    app_.add_handler(CommandHandler("admin", admin_menu))
+    app_.add_handler(CommandHandler("stats", cmd_stats))
+    app_.add_handler(CommandHandler("sales", cmd_sales))
+    app_.add_handler(CommandHandler("status", cmd_status))
+    app_.add_handler(CommandHandler("grant", cmd_grant))
+    app_.add_handler(CommandHandler("revoke", cmd_revoke))
+
     return app_
 
 
@@ -261,7 +419,6 @@ async def on_shutdown():
     _keepalive_stop.set()
     try:
         if application is not None:
-            # Снять webhook не обязательно, но аккуратнее
             try:
                 await application.bot.delete_webhook(drop_pending_updates=False)
             except Exception:
@@ -276,6 +433,5 @@ async def on_shutdown():
 # Запуск локально / на Render
 # ============================================================================
 if __name__ == "__main__":
-    # Для локального запуска можно указать PUBLIC_URL вручную.
     # На Render просто используем Start Command:  python bot.py
     uvicorn.run(app, host="0.0.0.0", port=PORT)
