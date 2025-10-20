@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import threading
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -174,11 +175,6 @@ def ask_llm(user_id: int, prompt: str) -> str:
     if real == MODEL_DEEPSEEK:
         return _ask_deepseek(user_id, prompt)
     return _ask_openai(user_id, prompt)
-def ask_llm(user_id: int, prompt: str) -> str:
-    real = _user_model.get(user_id, DEFAULT_MODEL)
-    if real == MODEL_DEEPSEEK:
-        return _ask_deepseek(user_id, prompt)
-    return _ask_openai(user_id, prompt)
 
 
 # ---------- Images (Replicate: Flux-1 Schnell) ----------
@@ -190,21 +186,27 @@ def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024)
         raise RuntimeError("REPLICATE_KEY пуст — подключите ключ Replicate в .env")
 
     model = "black-forest-labs/flux-1-schnell"
-    headers = {"Authorization": f"Token {REPLICATE_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Token {REPLICATE_KEY}",
+        "Content-Type": "application/json"
+    }
 
     create_payload = {
-        "version": None,
         "input": {
             "prompt": prompt,
             "width": width,
             "height": height,
             "num_outputs": 1,
-            "go_fast": True,
-        },
-        "model": model,
+            "go_fast": True
+        }
     }
 
-    create = requests.post("https://api.replicate.com/v1/predictions", json=create_payload, headers=headers, timeout=30)
+    create = requests.post(
+        f"https://api.replicate.com/v1/models/{model}/predictions",
+        json=create_payload,
+        headers=headers,
+        timeout=30
+    )
     create.raise_for_status()
     prediction = create.json()
     pred_id = prediction.get("id")
@@ -223,7 +225,7 @@ def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024)
         status = prediction.get("status")
         if status == "succeeded":
             break
-        asyncio.sleep(1)
+        time.sleep(1)
 
     if status != "succeeded":
         err = prediction.get("error") or status
