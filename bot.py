@@ -26,6 +26,7 @@ BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 OPENAI_KEY     = os.getenv("OPENAI_KEY", "")
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_KEY", "")
 CRYPTOPAY_KEY  = os.getenv("CRYPTOPAY_KEY", "")
+REPLICATE_KEY  = os.getenv("REPLICATE_KEY", "")
 ADMIN_ID       = int(os.getenv("ADMIN_ID", "0"))
 PORT           = int(os.getenv("PORT", "10000"))
 
@@ -48,6 +49,7 @@ DEFAULT_MODEL  = MODEL_OPENAI
 # Выбор пользователя
 _user_model_visual: dict[int, str] = {}  # «название модели» которое видит пользователь
 _user_model: dict[int, str] = {}         # фактический backend (OpenAI/DeepSeek)
+_awaiting_img_prompt: dict[int, bool] = {}
 
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
@@ -172,12 +174,82 @@ def ask_llm(user_id: int, prompt: str) -> str:
     if real == MODEL_DEEPSEEK:
         return _ask_deepseek(user_id, prompt)
     return _ask_openai(user_id, prompt)
+def ask_llm(user_id: int, prompt: str) -> str:
+    real = _user_model.get(user_id, DEFAULT_MODEL)
+    if real == MODEL_DEEPSEEK:
+        return _ask_deepseek(user_id, prompt)
+    return _ask_openai(user_id, prompt)
 
+
+# ---------- Images (Replicate: Flux-1 Schnell) ----------
+def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024) -> list[str]:
+    """
+    Блокирующая генерация через Replicate. Возвращает список URL готовых изображений.
+    """
+    if not REPLICATE_KEY:
+        raise RuntimeError("REPLICATE_KEY пуст — подключите ключ Replicate в .env")
+
+    model = "black-forest-labs/flux-1-schnell"
+    headers = {"Authorization": f"Token {REPLICATE_KEY}", "Content-Type": "application/json"}
+
+    create_payload = {
+        "version": None,
+        "input": {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "num_outputs": 1,
+            "go_fast": True,
+        },
+        "model": model,
+    }
+
+    create = requests.post("https://api.replicate.com/v1/predictions", json=create_payload, headers=headers, timeout=30)
+    create.raise_for_status()
+    prediction = create.json()
+    pred_id = prediction.get("id")
+    if not pred_id:
+        raise RuntimeError(f"Replicate: не получили id предсказания: {prediction}")
+
+    status = prediction.get("status")
+    get_url = f"https://api.replicate.com/v1/predictions/{pred_id}"
+
+    for _ in range(60):
+        if status in ("succeeded", "failed", "canceled"):
+            break
+        poll = requests.get(get_url, headers=headers, timeout=15)
+        poll.raise_for_status()
+        prediction = poll.json()
+        status = prediction.get("status")
+        if status == "succeeded":
+            break
+        asyncio.sleep(1)
+
+    if status != "succeeded":
+        err = prediction.get("error") or status
+        raise RuntimeError(f"Replicate: задача не удалась: {err}")
+
+    output = prediction.get("output") or []
+    if isinstance(output, str):
+        output = [output]
+    return output
+
+
+async def generate_image_and_send(user_id: int, chat_id: int, prompt: str, bot) -> None:
+    try:
+        urls = await asyncio.to_thread(_replicate_generate_sync, prompt)
+        if not urls:
+            await bot.send_message(chat_id=chat_id, text="Не удалось получить изображение.")
+            return
+        await bot.send_photo(chat_id=chat_id, photo=urls[0], caption="Готово ✅")
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text=f"Ошибка генерации: {e}")
 # ---------- UI ----------
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Выбрать модель", callback_data="models")],
         [InlineKeyboardButton("🎛 Режимы", callback_data="modes")],
+        [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
@@ -187,17 +259,34 @@ def main_keyboard() -> InlineKeyboardMarkup:
 def _models_menu_text(mode: str = "short") -> str:
     if mode == "short":
         return (
-            "Claude 4.5 Sonnet\n"
-            "🚗 Средний: GPT-5, OpenAI o4-mini, Claude 3.5 Haiku\n"
-            "🚲 Базовый: GPT-5 mini, GPT-4o mini, Gemini Flash 2.5, DeepSeek V3.2\n\n"
+            "<b>Кратко о моделях</b>\n"
+            "• <b>GPT-5</b> — флагман для сложных задач, кодинга и длинных контекстов.\n"
+            "• <b>Claude 4.5 Sonnet</b> — силён в анализе, стиле и длинных ответах.\n"
+            "• <b>Gemini 2.5 Pro</b> — хороший баланс скорости и качества, мультимодальность.\n"
+            "• <b>OpenAI o3</b> — логика и рассуждения, аккуратный тон.\n"
+            "• <b>DeepSeek V3.2</b> — быстрые и экономные ответы, отлично для повседневки.\n"
+            "• <b>OpenAI o4-mini</b> — быстрые короткие ответы и прототипирование.\n"
+            "• <b>GPT-5 mini</b> — лёгкая версия для черновиков и быстрых итераций.\n"
+            "• <b>GPT-4o search</b> — модель с упором на поиск/извлечение фактов.\n"
+            "• <b>GPT-4o mini</b> — экономичная альтернатива для простых задач.\n"
+            "• <b>Claude 3.5 Haiku</b> — очень быстро на коротких запросах.\n"
+            "• <b>Gemini 2.5 Flash</b> — быстрые черновики, резюме, списки.\n\n"
             "Выберите модель для работы:"
         )
     else:
         return (
-            "<b>О моделях</b>\n"
-            "• Топовые подойдут для сложных задач и длинных текстов.\n"
-            "• Средние — баланс скорости и качества.\n"
-            "• Базовые — быстрые ответы на повседневные вопросы.\n\n"
+            "<b>Подробно о моделях</b>\n"
+            "<b>GPT-5</b> — топ по качеству кода, сложным рассуждениям и длинным контекстам. Рекомендуется для архитектуры, аудитов, сложных SQL и интеграций.\n\n"
+            "<b>Claude 4.5 Sonnet</b> — силён в языке и стиле: эссе, стратегии, юридические/деловые тексты, аккуратные объяснения. Хорош на огромных документах.\n\n"
+            "<b>Gemini 2.5 Pro</b> — сбалансирован: анализ, идеи, мультимодальные задачи. Подходит для презентаций, маркетинга и быстрых исследований.\n\n"
+            "<b>OpenAI o3</b> — фокус на логике/Chain-of-Thought: пошаговые решения, математика, тонкая аргументация, проверка гипотез.\n\n"
+            "<b>DeepSeek V3.2</b> — очень быстрый и экономичный: повседневные вопросы, резюме, генерация простых текстов и черновики.\n\n"
+            "<b>OpenAI o4-mini</b> — быстрые ответы и прототипирование: черновые спецификации, user stories, наброски кода.\n\n"
+            "<b>GPT-5 mini</b> — минимальные задержки: идеи, списки, короткие подсказки, быстрые итерации.\n\n"
+            "<b>GPT-4o search</b> — приоритизирует поиск и извлечение: набор фактов, цитаты, обзорные справки.\n\n"
+            "<b>GPT-4o mini</b> — экономичный универсал для простых задач/переводов и быстрых советов.\n\n"
+            "<b>Claude 3.5 Haiku</b> — молниеносные короткие ответы и рефакторинг текста, подсветка смысла.\n\n"
+            "<b>Gemini 2.5 Flash</b> — резюме страниц, TODO-списки, короткие письма, быстрые описания.\n\n"
             "Выберите модель:"
         )
 
@@ -234,7 +323,48 @@ def modes_keyboard() -> InlineKeyboardMarkup:
 def current_mode_label(user_id: int) -> str:
     key = _user_task_mode.get(user_id, "default")
     return TASK_MODES.get(key, TASK_MODES["default"])["label"]
+# =========================
+# Кнопка/команда генерации изображений
+# =========================
+async def on_img_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
+    user_id = q.from_user.id
+    if not await is_premium(user_id):
+        await q.message.reply_text(
+            "Доступно в Премиум.\n\n"
+            "Премиум даёт:\n"
+            "• Безлимитные сообщения\n"
+            "• Доступ ко всем моделям\n"
+            "• Генерацию изображений\n\n"
+            "Нажмите «Купить подписку», стоимость $3 на 30 дней.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Купить подписку", callback_data="buy")]]
+            )
+        )
+        return
+
+    _awaiting_img_prompt[user_id] = True
+    await q.message.reply_text("Опиши картинку текстом (1–2 предложения). Я сгенерирую изображение.")
+
+async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_premium(user_id):
+        await update.message.reply_text(
+            "Генерация изображений доступна в Премиум ($3/30 дней).",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Купить подписку", callback_data="buy")]]
+            )
+        )
+        return
+    _awaiting_img_prompt[user_id] = True
+    await update.message.reply_text(
+        "Опиши картинку текстом. Пример: «синий неоновый город, дождь, стиль киберпанк»."
+    )
 # =========================
 # /start + рефералка
 # =========================
@@ -460,7 +590,7 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if not CRYPTOPAY_KEY:
-        await q.message.reply_text("💳 Оплата не подключена (нет CRYPTOPAY_KEY).")
+        await q.message.reply_text("Оплата не подключена (нет CRYPTOPAY_KEY).")
         return
 
     payload = str(q.from_user.id)
@@ -474,7 +604,17 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
     j = r.json()
     url = j["result"]["pay_url"]
-    await q.message.reply_text(f"💳 Оплати подписку по ссылке:\n{url}")
+
+    text = (
+        "Оплата подписки на 30 дней: $3\n\n"
+        "<b>Премиум даёт</b>:\n"
+        "• Безлимитные сообщения (без очередей)\n"
+        "• Доступ ко <b>всем</b> моделям\n"
+        "• <b>Генерацию изображений</b> (Replicate · Flux-1 Schnell)\n"
+        "• Приоритетную обработку\n\n"
+        f"Ссылка на оплату:\n{url}"
+    )
+    await q.message.reply_text(text, parse_mode="HTML")
 
 # =========================
 # Сообщения пользователей
@@ -482,6 +622,19 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
+
+    # Если ждём промпт для изображения — перехватываем
+    if _awaiting_img_prompt.get(user_id):
+        _awaiting_img_prompt[user_id] = False
+        if not await is_premium(user_id):
+            await update.message.reply_text(
+                "Генерация изображений только для Премиум.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Купить подписку", callback_data="buy")]])
+            )
+            return
+        await update.message.reply_text("Генерирую изображение…")
+        await generate_image_and_send(user_id, update.effective_chat.id, text, context.bot)
+        return
 
     if await is_premium(user_id):
         reply = ask_llm(user_id, text)
@@ -710,6 +863,10 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("add_premium",    cmd_add_premium))
     app_.add_handler(CommandHandler("remove_premium", cmd_remove_premium))
     app_.add_handler(CommandHandler("broadcast",      cmd_broadcast))
+
+    # кнопка/команда генерации изображений
+    app_.add_handler(CallbackQueryHandler(on_img_btn, pattern=r"^img$"))
+    app_.add_handler(CommandHandler("img", cmd_img))
 
     # кнопки
     app_.add_handler(CallbackQueryHandler(on_buy_btn,      pattern=r"^buy$"))
