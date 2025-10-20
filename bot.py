@@ -185,7 +185,7 @@ def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024)
     if not REPLICATE_KEY:
         raise RuntimeError("REPLICATE_KEY пуст — подключите ключ Replicate в .env")
 
-    model = "black-forest-labs/flux-1-schnell"
+    model = "black-forest-labs/flux-schnell"
     headers = {
         "Authorization": f"Token {REPLICATE_KEY}",
         "Content-Type": "application/json"
