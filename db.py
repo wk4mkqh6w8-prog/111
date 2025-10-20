@@ -3,8 +3,13 @@ from datetime import datetime, timezone, date
 
 import aiosqlite
 
-# Путь к БД (можно переопределить переменной окружения)
-DB_PATH = os.getenv("DATABASE_PATH", "/tmp/neurobot.sqlite3")
+# Путь к БД. На проде задаём SQLITE_PATH=/var/data/neurobot.db
+DB_PATH = os.getenv("SQLITE_PATH", "./data/neurobot.db")
+# гарантируем, что папка для файла БД существует
+def _ensure_db_dir():
+    d = os.path.dirname(DB_PATH)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
 
 # ========= ВСПОМОГАТЕЛЬНЫЕ =========
@@ -22,6 +27,7 @@ def _today_str() -> str:
 
 async def init_db():
     """Создаём таблицы, если их нет."""
+    _ensure_db_dir()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(
             """
