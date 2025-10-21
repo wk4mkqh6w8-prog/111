@@ -50,6 +50,13 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_messages_user_date
               ON messages(user_id, created_at);
 
+            -- Отметки об отправке уведомления об окончании премиума
+            CREATE TABLE IF NOT EXISTS premium_notices (
+                user_id          INTEGER PRIMARY KEY,
+                expired_notified INTEGER NOT NULL DEFAULT 0,
+                last_warn_at     TEXT
+            );
+
             -- Премиум статус
             CREATE TABLE IF NOT EXISTS premiums (
                 user_id     INTEGER PRIMARY KEY,
@@ -256,6 +263,50 @@ async def revoke_premium(user_id: int):
         await db.execute("DELETE FROM premiums WHERE user_id = ?", (user_id,))
         await db.commit()
 
+async def get_premium_expires(user_id: int) -> str | None:
+    """Вернёт ISO-дату окончания премиума или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT expires_at FROM premiums WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
+
+
+async def list_expired_unnotified(now_iso: str) -> list[int]:
+    """
+    Вернёт user_id тех, у кого срок уже истёк (expires_at <= now_iso)
+    и кому мы ещё не слали уведомление.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT p.user_id
+            FROM premiums p
+            LEFT JOIN premium_notices n ON n.user_id = p.user_id
+            WHERE p.expires_at <= ?
+              AND COALESCE(n.expired_notified, 0) = 0
+            """,
+            (now_iso,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+
+async def mark_expired_notified(user_id: int, when_iso: str):
+    """Пометить, что уведомление об окончании отправлено."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO premium_notices(user_id, expired_notified, last_warn_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              expired_notified = 1,
+              last_warn_at     = excluded.last_warn_at
+            """,
+            (user_id, when_iso),
+        )
+        await db.commit()
 
 # ========= СТАТИСТИКА ДЛЯ АДМИНКИ =========
 

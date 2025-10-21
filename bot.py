@@ -108,7 +108,8 @@ oai = OpenAI(api_key=OPENAI_KEY)
 from db import (  # noqa
     init_db, add_user, is_premium, can_send_message, set_premium,
     get_usage_today, get_free_credits, consume_free_credit, add_free_credits,
-    set_referrer_if_empty, count_paid_users_today, count_paid_users_total
+    set_referrer_if_empty, count_paid_users_today, count_paid_users_total,
+    get_premium_expires, list_expired_unnotified, mark_expired_notified
 )
 
 # =========================
@@ -418,19 +419,35 @@ async def _render_profile_html(user_id: int) -> str:
     used_today = await get_usage_today(user_id)
     bonus = await get_free_credits(user_id)
 
+    me = await application.bot.get_me()
+    deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
+    visual = _user_model_visual.get(user_id, "GPT-4o mini")
+    mode_lbl = current_mode_label(user_id)
+
     if prem:
         left_text = "∞ (Премиум)"
         status = "Премиум"
+        # Покажем до какого числа и сколько осталось
+        exp_iso = await get_premium_expires(user_id)
+        extra = ""
+        if exp_iso:
+            try:
+                exp_dt = datetime.fromisoformat(exp_iso)
+            except Exception:
+                exp_dt = None
+            if exp_dt:
+                now_dt = datetime.utcnow()
+                if exp_dt.tzinfo:  # если в expires_at есть tz
+                    now_dt = datetime.now(exp_dt.tzinfo)
+                remaining = exp_dt - now_dt
+                days_left = max(0, remaining.days + (1 if remaining.seconds > 0 else 0))
+                extra = f"\nПремиум до: <b>{exp_dt.strftime('%d.%m.%Y %H:%M')}</b> (осталось ~<b>{days_left}</b> дн.)"
+        status += extra
     else:
         left_day = max(0, DAILY_LIMIT - used_today)
         total_left = left_day + bonus
         left_text = f"{total_left} (дневной лимит {left_day}, бонусов {bonus})"
         status = "Обычный"
-
-    me = await application.bot.get_me()
-    deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
-    visual = _user_model_visual.get(user_id, "GPT-4o mini")
-    mode_lbl = current_mode_label(user_id)
 
     return (
         f"👤 <b>Профиль</b>\n"
@@ -618,6 +635,69 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await q.message.reply_text(text, parse_mode="HTML")
 
+# =========================
+# Команды /buy /models /mode /help
+# =========================
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /buy — та же логика, что и по кнопке."""
+    if not CRYPTOPAY_KEY:
+        await update.message.reply_text("Оплата не подключена (нет CRYPTOPAY_KEY).")
+        return
+
+    payload = str(update.effective_user.id)
+    headers = {"Crypto-Pay-API-Token": CRYPTOPAY_KEY}
+    data = {
+        "asset": "USDT",
+        "amount": "3",
+        "description": "Подписка на 30 дней",
+        "payload": payload,
+    }
+    r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
+    j = r.json()
+    url = j["result"]["pay_url"]
+
+    text = (
+        "Оплата подписки на 30 дней: $3\n\n"
+        "<b>Премиум даёт</b>:\n"
+        "• Безлимитные сообщения (без очередей)\n"
+        "• Доступ ко <b>всем</b> моделям\n"
+        "• <b>Генерацию изображений</b>\n"
+        "• Приоритетную обработку\n\n"
+        f"Ссылка на оплату:\n{url}"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /models — показать меню выбора модели."""
+    text = _models_menu_text("short")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=models_keyboard_visual())
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /mode — показать меню режимов."""
+    txt = (
+        "Выберите режим ответа:\n"
+        "• <b>Стандарт</b> — обычные ответы\n"
+        "• <b>Кодинг</b> — больше кода и примеров\n"
+        "• <b>SEO</b> — тексты и структура для SEO\n"
+        "• <b>Перевод</b> — RU↔EN, аккуратный стиль\n"
+        "• <b>Резюме</b> — краткие выжимки\n"
+        "• <b>Креатив</b> — идеи, варианты, слоганы"
+    )
+    await update.message.reply_text(txt, parse_mode="HTML", reply_markup=modes_keyboard())
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help — краткая справка с основными действиями."""
+    txt = (
+        "<b>Как пользоваться ботом</b>\n\n"
+        "• Напишите любое сообщение — я отвечу.\n"
+        "• Нужна картинка? Команда /img.\n"
+        "• Выбор модели — /models.\n"
+        "• Переключить режим — /mode.\n"
+        "• Профиль и рефералка — /profile, /ref.\n"
+        "• Премиум ($3/30 дней) — /buy.\n\n"
+        "Кнопки ниже — быстрый доступ:"
+    )
+    await update.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
 # =========================
 # Сообщения пользователей
 # =========================
@@ -845,6 +925,38 @@ async def _webhook_guard_loop():
             logger.warning("webhook guard error: %s", e)
         await asyncio.sleep(600)  # 10 минут
 
+async def _premium_expiry_notifier_loop():
+    """Раз в 15 минут ищем истёкшие премиумы и шлём 1 уведомление."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            now_iso = datetime.utcnow().isoformat()
+            user_ids = await list_expired_unnotified(now_iso)
+            for uid in user_ids:
+                # отправим уведомление
+                try:
+                    await application.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            "⛔️ Ваш премиум закончился.\n\n"
+                            "Продлите подписку, чтобы сохранить безлимит, доступ ко всем моделям "
+                            "и генерацию изображений."
+                        ),
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("💳 Купить подписку", callback_data="buy")]]
+                        )
+                    )
+                except Exception:
+                    pass
+                # пометить, что уведомили
+                try:
+                    await mark_expired_notified(uid, now_iso)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("premium notifier error: %s", e)
+        await asyncio.sleep(900)  # 15 минут
+
 # =========================
 # Глобальный error-handler PTB (чтобы не падал на 400)
 # =========================
@@ -865,6 +977,10 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("add_premium",    cmd_add_premium))
     app_.add_handler(CommandHandler("remove_premium", cmd_remove_premium))
     app_.add_handler(CommandHandler("broadcast",      cmd_broadcast))
+    app_.add_handler(CommandHandler("buy",    cmd_buy))
+    app_.add_handler(CommandHandler("models", cmd_models))
+    app_.add_handler(CommandHandler("mode",   cmd_mode))
+    app_.add_handler(CommandHandler("help",   cmd_help))
 
     # кнопка/команда генерации изображений
     app_.add_handler(CallbackQueryHandler(on_img_btn, pattern=r"^img$"))
@@ -911,6 +1027,7 @@ async def on_startup():
 
     threading.Thread(target=_keepalive_loop, daemon=True).start()
     asyncio.get_event_loop().create_task(_webhook_guard_loop())
+    asyncio.get_event_loop().create_task(_premium_expiry_notifier_loop())
 
     logger.info("🚀 Startup complete. Listening on port %s", PORT)
 
