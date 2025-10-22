@@ -30,6 +30,9 @@ CRYPTOPAY_KEY  = os.getenv("CRYPTOPAY_KEY", "")
 REPLICATE_KEY  = os.getenv("REPLICATE_KEY", "")
 ADMIN_ID       = int(os.getenv("ADMIN_ID", "0"))
 PORT           = int(os.getenv("PORT", "10000"))
+SUPPORT_EMAIL      = os.getenv("SUPPORT_EMAIL", "support@neurobotgpt.ru")
+PUBLIC_OFFER_URL   = os.getenv("PUBLIC_OFFER_URL", "https://disk.yandex.ru/i/wdHQVfYcJGjwhw")
+SUPPORT_WORK_HOURS = os.getenv("SUPPORT_WORK_HOURS", "10:00–19:00 MSK")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN пуст")
@@ -255,6 +258,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
     ])
 
@@ -597,6 +601,96 @@ async def on_mode_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(f"✅ Режим «{lbl}» активирован. Готов работать!", reply_markup=main_keyboard())
     except Exception:
         await q.message.reply_text(f"✅ Режим «{lbl}» активирован. Готов работать!", reply_markup=main_keyboard())
+
+# =========================
+# Помощь / FAQ / Оферта
+# =========================
+
+def _faq_text() -> str:
+    return (
+        "<b>FAQ — Частые вопросы</b>\n\n"
+        "• <b>Что даёт Премиум?</b>\n"
+        "  Безлимитные сообщения, доступ ко всем моделям и генерации изображений.\n\n"
+        "• <b>Сколько стоит Премиум и на сколько дней?</b>\n"
+        "  $3 за 30 дней. Оплатить можно через кнопку «Купить подписку».\n\n"
+        "• <b>Где посмотреть, когда закончится Премиум?</b>\n"
+        "  Откройте «👤 Профиль» — там дата окончания и оставшиеся дни.\n\n"
+        "• <b>Как работают лимиты без Премиум?</b>\n"
+        f"  {DAILY_LIMIT}/день + реферальные бонусы.\n\n"
+        "• <b>Как получить бонусы?</b>\n"
+        "  Пригласите друзей по вашей реферальной ссылке из Профиля — за каждого +25 заявок.\n\n"
+        "• <b>Возвраты и вопросы по оплатам</b>\n"
+        f"  Пишите на <a href='mailto:{SUPPORT_EMAIL}'>{SUPPORT_EMAIL}</a> — поможем. "
+        "Возврат средств возможен в случаях, предусмотренных законодательством РФ и условиями нашей оферты.\n\n"
+        "• <b>Конфиденциальность</b>\n"
+        "  Мы обрабатываем персональные данные по ФЗ-152 и используем их только для оказания услуг.\n"
+    )
+
+def _support_text() -> str:
+    return (
+        "<b>Техподдержка</b>\n\n"
+        f"• Email: <a href='mailto:{SUPPORT_EMAIL}'>{SUPPORT_EMAIL}</a>\n"
+        f"• Время ответа: в рабочие часы {SUPPORT_WORK_HOURS}\n\n"
+        "В письме укажите: ID в Telegram (из Профиля), кратко суть вопроса, скрин/ошибку и время события."
+    )
+
+async def on_help_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 FAQ", callback_data="help:faq"),
+         InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+        [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
+        [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
+    ])
+    await q.message.edit_text("Раздел помощи. Выберите:", reply_markup=kb)
+
+async def on_help_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+        [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help")]
+    ])
+    await q.message.edit_text(_faq_text(), parse_mode="HTML", reply_markup=kb)
+
+async def on_help_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
+        [InlineKeyboardButton("📚 FAQ", callback_data="help:faq")],
+        [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help")]
+    ])
+    await q.message.edit_text(_support_text(), parse_mode="HTML", reply_markup=kb)
+
+# Команды-псевдонимы
+async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_support_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
+        [InlineKeyboardButton("📚 FAQ", callback_data="help:faq")],
+        [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
+    ]))
+
+async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_faq_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+        [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
+    ]))
 
 # =========================
 # Оплата (CryptoPay)
@@ -981,6 +1075,8 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("models", cmd_models))
     app_.add_handler(CommandHandler("mode",   cmd_mode))
     app_.add_handler(CommandHandler("help",   cmd_help))
+    app_.add_handler(CommandHandler("support", cmd_support))
+    app_.add_handler(CommandHandler("faq",     cmd_faq))
 
     # кнопка/команда генерации изображений
     app_.add_handler(CallbackQueryHandler(on_img_btn, pattern=r"^img$"))
@@ -999,6 +1095,11 @@ def build_application() -> Application:
         lambda u, c: u.callback_query.message.edit_text("Главное меню:", reply_markup=main_keyboard()),
         pattern=r"^home$"
     ))
+   
+    # помощь / faq
+    app_.add_handler(CallbackQueryHandler(on_help_btn,     pattern=r"^help$"))
+    app_.add_handler(CallbackQueryHandler(on_help_faq,     pattern=r"^help:faq$"))
+    app_.add_handler(CallbackQueryHandler(on_help_support, pattern=r"^help:support$"))
 
     # сообщения
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
