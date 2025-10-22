@@ -258,7 +258,9 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+        # ↓ NEW: помощь сразу открывает /help, рядом отдельная кнопка FAQ
+        [InlineKeyboardButton("❓ Помощь", callback_data="help:how"),
+         InlineKeyboardButton("📚 FAQ",    callback_data="help:faq")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
     ])
 
@@ -675,6 +677,34 @@ async def on_help_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⬅️ Назад", callback_data="help")]
     ])
     await q.message.edit_text(_support_text(), parse_mode="HTML", reply_markup=kb)
+
+async def on_help_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открывает тот же текст, что и /help, но по кнопке."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    txt = (
+        "<b>Как пользоваться ботом</b>\n\n"
+        "• Напишите любое сообщение — я отвечу.\n"
+        "• Нужна картинка? Команда /img.\n"
+        "• Выбор модели — /models.\n"
+        "• Переключить режим — /mode.\n"
+        "• Профиль и рефералка — /profile, /ref.\n"
+        "• Премиум ($3/30 дней) — /buy.\n\n"
+        "Кнопки ниже — быстрый доступ:"
+    )
+
+    # мини-меню помощи с быстрыми ссылками
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 FAQ",          callback_data="help:faq"),
+         InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+        [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
+    ])
+    await q.message.edit_text(txt, parse_mode="HTML", reply_markup=kb)
 
 # Команды-псевдонимы
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1098,6 +1128,7 @@ def build_application() -> Application:
    
     # помощь / faq
     app_.add_handler(CallbackQueryHandler(on_help_btn,     pattern=r"^help$"))
+    app_.add_handler(CallbackQueryHandler(on_help_how,     pattern=r"^help:how$"))   # ← NEW
     app_.add_handler(CallbackQueryHandler(on_help_faq,     pattern=r"^help:faq$"))
     app_.add_handler(CallbackQueryHandler(on_help_support, pattern=r"^help:support$"))
 
