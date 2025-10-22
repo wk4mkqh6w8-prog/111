@@ -660,7 +660,7 @@ async def on_help_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help")]
+        [InlineKeyboardButton("⬅️ Назад", callback_data="omep")]
     ])
     await q.message.edit_text(_faq_text(), parse_mode="HTML", reply_markup=kb)
 
@@ -674,7 +674,7 @@ async def on_help_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
         [InlineKeyboardButton("📚 FAQ", callback_data="help:faq")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help")]
+        [InlineKeyboardButton("⬅️ Назад", callback_data="omep")]
     ])
     await q.message.edit_text(_support_text(), parse_mode="HTML", reply_markup=kb)
 
