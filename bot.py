@@ -54,6 +54,7 @@ DEFAULT_MODEL  = MODEL_OPENAI
 _user_model_visual: dict[int, str] = {}  # «название модели» которое видит пользователь
 _user_model: dict[int, str] = {}         # фактический backend (OpenAI/DeepSeek)
 _awaiting_img_prompt: dict[int, bool] = {}
+_pending_chat_rename: dict[int, int] = {}  # user_id -> chat_id
 
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
@@ -112,7 +113,11 @@ from db import (  # noqa
     init_db, add_user, is_premium, can_send_message, set_premium,
     get_usage_today, get_free_credits, consume_free_credit, add_free_credits,
     set_referrer_if_empty, count_paid_users_today, count_paid_users_total,
-    get_premium_expires, list_expired_unnotified, mark_expired_notified
+    get_premium_expires, list_expired_unnotified, mark_expired_notified,
+    # новые:
+    get_chat_mode, set_chat_mode, create_chat, list_chats,
+    set_active_chat, get_active_chat, add_chat_message, get_chat_history,
+    rename_chat, delete_chat
 )
 
 # =========================
@@ -129,6 +134,10 @@ DAILY_LIMIT = 5
 PRICE_RUB = 500                 # цена для пользователя (в рублях)
 PRICE_USDT = "5"                # сумма счёта для Crypto Pay (USDT), строкой как требует API
 PRICE_RUB_TEXT = f"{PRICE_RUB} ₽"
+
+# --- Диалоговые режимы ---
+DIALOG_SIMPLE = "simple"  # Быстрые ответы (без памяти)
+DIALOG_ROOMS  = "rooms"   # Диалоги с контекстом (чаты)
 
 # ---------- LLM ----------
 def _compose_prompt(user_id: int, user_text: str) -> list[dict]:
@@ -183,6 +192,51 @@ def ask_llm(user_id: int, prompt: str) -> str:
     if real == MODEL_DEEPSEEK:
         return _ask_deepseek(user_id, prompt)
     return _ask_openai(user_id, prompt)
+
+def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str) -> str:
+    """
+    history: список (role, content), роли: 'system' | 'user' | 'assistant'
+    """
+    # системное сообщение — как в обычном режиме (учитываем TASK_MODES):
+    sys_text = TASK_MODES.get(_user_task_mode.get(user_id, "default"), TASK_MODES["default"])["system"]
+    msgs = [{"role": "system", "content": sys_text}]
+    for role, content in history:
+        if role in ("user", "assistant"):
+            msgs.append({"role": role, "content": content})
+    msgs.append({"role": "user", "content": user_text})
+
+    real = _user_model.get(user_id, DEFAULT_MODEL)
+    if real == MODEL_DEEPSEEK:
+        # DeepSeek
+        try:
+            import httpx
+            url = "https://api.deepseek.com/chat/completions"
+            headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
+            payload = {"model": "deepseek-chat", "messages": msgs, "temperature": 0.7}
+            with httpx.Client(timeout=30) as s:
+                resp = s.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    try:
+                        err = resp.json()
+                        msg = err.get("error", {}).get("message") or err.get("message") or str(err)
+                    except Exception:
+                        msg = resp.text[:400]
+                    return f"DeepSeek API error {resp.status_code}: {msg}"
+                data = resp.json()
+            choice = (data or {}).get("choices", [{}])[0]
+            m = (choice or {}).get("message", {})
+            text = m.get("content") or (choice or {}).get("text") or ""
+            return text or "DeepSeek вернул пустой ответ."
+        except Exception as e:
+            return f"Ошибка DeepSeek: {e!s}"
+    else:
+        # OpenAI
+        r = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=msgs,
+            temperature=0.7,
+        )
+        return r.choices[0].message.content
 
 
 # ---------- Images (Replicate: Flux-1 Schnell) ----------
@@ -259,10 +313,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Выбрать модель", callback_data="models")],
         [InlineKeyboardButton("🎛 Режимы", callback_data="modes")],
+        [InlineKeyboardButton("💬 Диалоги", callback_data="dialog")],
         [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
-        # ↓ NEW: помощь сразу открывает /help, рядом отдельная кнопка FAQ
         [InlineKeyboardButton("❓ Помощь", callback_data="help:how"),
          InlineKeyboardButton("📚 FAQ",    callback_data="help:faq")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
@@ -336,6 +390,177 @@ def modes_keyboard() -> InlineKeyboardMarkup:
 def current_mode_label(user_id: int) -> str:
     key = _user_task_mode.get(user_id, "default")
     return TASK_MODES.get(key, TASK_MODES["default"])["label"]
+
+# ===== Диалоговые режимы (simple / rooms) =====
+
+def dialog_menu_text(mode: str) -> str:
+    common_note = "\n\n<i>ℹ️ Контекстный режим работает с любой выбранной моделью.</i>"
+    if mode == DIALOG_ROOMS:
+        return (
+            "<b>Диалоги с контекстом</b>\n"
+            "Создавайте отдельные чаты по темам: история сообщений сохраняется и учитывается в ответах."
+            f"{common_note}"
+        )
+    else:
+        return (
+            "<b>Быстрые ответы</b>\n"
+            "Каждое сообщение — независимое. История не копится, ответы максимально быстрые."
+            f"{common_note}"
+        )
+
+def dialog_keyboard(mode_now: str) -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(
+            ("✅ " if mode_now == DIALOG_SIMPLE else "") + "⚡ Быстрые ответы",
+            callback_data="dialog:simple"
+        )],
+        [InlineKeyboardButton(
+            ("✅ " if mode_now == DIALOG_ROOMS else "") + "🗂️ Диалоги с контекстом",
+            callback_data="dialog:rooms"
+        )],
+        [InlineKeyboardButton("📂 Мои чаты", callback_data="chats")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="home")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+async def on_dialog_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    mode = await get_chat_mode(q.from_user.id)
+    await q.message.edit_text(dialog_menu_text(mode), parse_mode="HTML", reply_markup=dialog_keyboard(mode))
+
+async def on_dialog_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    want = q.data.split("dialog:", 1)[-1]
+    want = DIALOG_ROOMS if want == "rooms" else DIALOG_SIMPLE
+    await set_chat_mode(q.from_user.id, want)
+
+    # Если включили rooms и нет активного чата — создадим первый
+    if want == DIALOG_ROOMS:
+        active = await get_active_chat(q.from_user.id)
+        if active is None:
+            cid = await create_chat(q.from_user.id, "Чат 1")
+            await set_active_chat(q.from_user.id, cid)
+
+    await q.message.edit_text(dialog_menu_text(want), parse_mode="HTML", reply_markup=dialog_keyboard(want))
+
+async def on_chats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    await set_chat_mode(user_id, DIALOG_ROOMS)  # при открытии списка чатов — сразу режим rooms
+    chats = await list_chats(user_id)
+    active = await get_active_chat(user_id)
+
+    rows = []
+    if not chats:
+        rows.append([InlineKeyboardButton("➕ Создать первый чат", callback_data="chat:new")])
+    else:
+        for cid, title in chats[:10]:
+            prefix = "✅ " if active == cid else ""
+            rows.append([InlineKeyboardButton(f"{prefix}{title}", callback_data=f"chat:open:{cid}")])
+        rows.append([InlineKeyboardButton("➕ Новый чат", callback_data="chat:new")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="dialog")])
+    await q.message.edit_text("Ваши чаты:", reply_markup=InlineKeyboardMarkup(rows))
+
+async def on_chat_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    chats = await list_chats(user_id)
+    title = f"Чат {len(chats)+1}"
+    cid = await create_chat(user_id, title)
+    await set_active_chat(user_id, cid)
+    await on_chats_btn(update, context)
+
+async def on_chat_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    cid = int(q.data.split("chat:open:", 1)[-1])
+    await set_active_chat(user_id, cid)
+
+    # найдём заголовок чата
+    chats = await list_chats(user_id)
+    title = next((t for (i, t) in chats if i == cid), f"Чат {cid}")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Переименовать", callback_data=f"chat:rename:{cid}")],
+        [InlineKeyboardButton("🗑️ Удалить",       callback_data=f"chat:delete:{cid}")],
+        [InlineKeyboardButton("⬅️ К списку чатов", callback_data="chats")]
+    ])
+    await q.message.edit_text(f"Чат: <b>{title}</b>\nВыберите действие:", parse_mode="HTML", reply_markup=kb)
+
+async def on_chat_rename_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    cid = int(q.data.split("chat:rename:", 1)[-1])
+    _pending_chat_rename[user_id] = cid
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="chats")]])
+    await q.message.edit_text("Отправьте новое название чата (1–80 символов):", reply_markup=kb)
+
+async def on_chat_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    cid = int(q.data.split("chat:delete:", 1)[-1])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"chat:delete:do:{cid}")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data="chats")]
+    ])
+    await q.message.edit_text("Удалить этот чат? Действие необратимо.", reply_markup=kb)
+
+async def on_chat_delete_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    cid = int(q.data.split("chat:delete:do:", 1)[-1])
+
+    # если удаляем активный — потом сбросим active_chat_id
+    active = await get_active_chat(user_id)
+    ok = await delete_chat(user_id, cid)
+    if ok and active == cid:
+        await set_active_chat(user_id, None)
+
+    # если после удаления нет чатов — предложим создать первый
+    chats = await list_chats(user_id)
+    if not chats:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Создать чат", callback_data="chat:new")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="dialog")]
+        ])
+        await q.message.edit_text("Чат удалён. У вас пока нет чатов.", reply_markup=kb)
+        return
+
+    # иначе вернёмся к списку
+    await on_chats_btn(update, context)
+
 # =========================
 # Кнопка/команда генерации изображений
 # =========================
@@ -844,6 +1069,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
 
+        # Переименование чата — если ждём от пользователя новое имя
+    if _pending_chat_rename.get(user_id):
+        cid = _pending_chat_rename[user_id]
+        new_title = (text or "").strip()[:80]
+        if not new_title:
+            await update.message.reply_text("Название пустое. Отправьте текст от 1 до 80 символов или нажмите «Отмена» в меню.")
+            return
+        ok = await rename_chat(user_id, cid, new_title)
+        _pending_chat_rename.pop(user_id, None)
+        if ok:
+            await update.message.reply_text("Готово: чат переименован ✅")
+        else:
+            await update.message.reply_text("Не удалось переименовать чат.")
+        return
+
     # Если ждём промпт для изображения — перехватываем
     if _awaiting_img_prompt.get(user_id):
         _awaiting_img_prompt[user_id] = False
@@ -857,27 +1097,45 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await generate_image_and_send(user_id, update.effective_chat.id, text, context.bot)
         return
 
-    if await is_premium(user_id):
+    # лимиты как раньше
+    if not await is_premium(user_id):
+        if await can_send_message(user_id, limit=DAILY_LIMIT):
+            pass
+        elif await consume_free_credit(user_id):
+            pass
+        else:
+            await update.message.reply_text(
+                "🚫 Лимит исчерпан.\n"
+                f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+                f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
+                "Купите подписку «💳 Купить подписку» для безлимита."
+            )
+            return
+
+    # выбор по диалоговому режиму
+    mode = await get_chat_mode(user_id)
+    if mode == DIALOG_ROOMS:
+        # нужен активный чат, если нет — создадим
+        cid = await get_active_chat(user_id)
+        if cid is None:
+            cid = await create_chat(user_id, "Чат 1")
+            await set_active_chat(user_id, cid)
+
+        # загрузим историю (последние 20 сообщений) + добавим текущий запрос
+        history = await get_chat_history(cid, limit=20)
+        reply = ask_llm_context(user_id, history, text)
+
+        # сохраним и вопрос, и ответ в историю
+        await add_chat_message(cid, "user", text)
+        await add_chat_message(cid, "assistant", reply)
+
+        await update.message.reply_text(reply)
+        return
+    else:
+        # быстрый режим (как раньше)
         reply = ask_llm(user_id, text)
         await update.message.reply_text(reply)
         return
-
-    if await can_send_message(user_id, limit=DAILY_LIMIT):
-        reply = ask_llm(user_id, text)
-        await update.message.reply_text(reply)
-        return
-
-    if await consume_free_credit(user_id):
-        reply = ask_llm(user_id, text)
-        await update.message.reply_text(reply)
-        return
-
-    await update.message.reply_text(
-        "🚫 Лимит исчерпан.\n"
-        f"— Дневной лимит: {DAILY_LIMIT}/день\n"
-        f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
-        "Купите подписку «💳 Купить подписку» для безлимита."
-    )
 
 # =========================
 # Админ-команды
@@ -1149,6 +1407,16 @@ def build_application() -> Application:
 
     # сообщения
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    
+    # диалоговые режимы и чаты
+    app_.add_handler(CallbackQueryHandler(on_dialog_btn,    pattern=r"^dialog$"))
+    app_.add_handler(CallbackQueryHandler(on_dialog_select, pattern=r"^dialog:(simple|rooms)$"))
+    app_.add_handler(CallbackQueryHandler(on_chats_btn,     pattern=r"^chats$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_new,      pattern=r"^chat:new$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_open,     pattern=r"^chat:open:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_rename_ask,   pattern=r"^chat:rename:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_delete_confirm, pattern=r"^chat:delete:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_delete_do,    pattern=r"^chat:delete:do:\d+$"))
 
     # error-handler
     app_.add_error_handler(on_error)

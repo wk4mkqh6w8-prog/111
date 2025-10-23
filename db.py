@@ -74,6 +74,31 @@ async def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_premium_events_day
               ON premium_events(activated_at);
+              -- Режим диалога и активный чат
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id         INTEGER PRIMARY KEY,
+                chat_mode       TEXT NOT NULL DEFAULT 'simple', -- 'simple' | 'rooms'
+                active_chat_id  INTEGER
+            );
+
+            -- Список чатов пользователя
+            CREATE TABLE IF NOT EXISTS chats (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                title       TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_id);
+
+            -- История сообщений по чатам
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id     INTEGER NOT NULL,
+                role        TEXT NOT NULL,   -- 'system' | 'user' | 'assistant'
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id);
             """
         )
         await db.commit()
@@ -337,3 +362,119 @@ async def count_paid_users_total() -> int:
         n = (await cur.fetchone())[0]
         await cur.close()
         return int(n)
+
+# ========= ДИАЛОГОВЫЕ РЕЖИМЫ И ЧАТЫ =========
+
+async def get_chat_mode(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT chat_mode FROM user_prefs WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            await db.execute("INSERT INTO user_prefs(user_id, chat_mode, active_chat_id) VALUES (?, 'simple', NULL)", (user_id,))
+            await db.commit()
+            return "simple"
+        return row[0] or "simple"
+
+async def set_chat_mode(user_id: int, mode: str):
+    mode = "rooms" if mode == "rooms" else "simple"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_prefs(user_id, chat_mode, active_chat_id)
+            VALUES (?, ?, NULL)
+            ON CONFLICT(user_id) DO UPDATE SET chat_mode = excluded.chat_mode
+            """,
+            (user_id, mode),
+        )
+        await db.commit()
+
+async def create_chat(user_id: int, title: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chats(user_id, title, created_at) VALUES (?, ?, ?)",
+            (user_id, title.strip() or "Новый чат", _utcnow_iso()),
+        )
+        chat_id = (await db.execute("SELECT last_insert_rowid()")).fetchone
+        cur = await db.execute("SELECT last_insert_rowid()")
+        row = await cur.fetchone()
+        await cur.close()
+        new_id = int(row[0])
+        await db.commit()
+        return new_id
+
+async def list_chats(user_id: int) -> list[tuple[int, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, title FROM chats WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1]) for r in rows]
+
+async def set_active_chat(user_id: int, chat_id: int | None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_prefs(user_id, chat_mode, active_chat_id)
+            VALUES (?, 'rooms', ?)
+            ON CONFLICT(user_id) DO UPDATE SET active_chat_id = excluded.active_chat_id
+            """,
+            (user_id, chat_id),
+        )
+        await db.commit()
+
+async def get_active_chat(user_id: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT active_chat_id FROM user_prefs WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row and row[0] is not None else None
+
+async def add_chat_message(chat_id: int, role: str, content: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chat_messages(chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, role, content, _utcnow_iso()),
+        )
+        await db.commit()
+
+async def get_chat_history(chat_id: int, limit: int = 20) -> list[tuple[str, str]]:
+    """
+    Возвращает список (role, content) последних сообщений, по возрастанию времени.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT role, content
+            FROM chat_messages
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out = [(r[0], r[1]) for r in rows][::-1]  # перевернём, чтобы было по времени
+        return out
+
+async def rename_chat(user_id: int, chat_id: int, new_title: str) -> bool:
+    new_title = (new_title or "").strip()[:80] or "Без названия"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE chats SET title = ? WHERE id = ? AND user_id = ?",
+            (new_title, chat_id, user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+async def delete_chat(user_id: int, chat_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Сначала удалим историю
+        await db.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
+        # Потом сам чат (с проверкой владельца)
+        cur = await db.execute("DELETE FROM chats WHERE id = ? AND user_id = ?", (chat_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
