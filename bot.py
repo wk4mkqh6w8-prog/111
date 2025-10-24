@@ -1012,6 +1012,12 @@ def _faq_text() -> str:
         f"  {DAILY_LIMIT}/день + реферальные бонусы.\n\n"
         "• <b>Как получить бонусы?</b>\n"
         "  Пригласите друзей по вашей реферальной ссылке из Профиля — за каждого +25 заявок.\n\n"
+        "• <b>Могу ли я озвучить ответы бота?</b>\n"
+        "  Да, просто нажмите кнопку «🎧 Озвучить» под любым сообщением.\n\n"
+        "• <b>Можно ли отправлять документы?</b>\n"
+        "  Да, бот поддерживает .txt, .md, .csv и .pdf — он сделает краткое резюме и выделит ключевые пункты.\n\n"
+        "• <b>Можно ли анализировать фото?</b>\n"
+        "  Да, просто отправьте изображение или скриншот — бот опишет, что на нём, и выделит детали.\n\n"
         "• <b>Возвраты и вопросы по оплатам</b>\n"
         f"  Пишите на <a href='mailto:{SUPPORT_EMAIL}'>{SUPPORT_EMAIL}</a> — поможем. "
         "Возврат средств возможен в случаях, предусмотренных законодательством РФ и условиями нашей оферты.\n\n"
@@ -1080,6 +1086,9 @@ async def on_help_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "<b>Как пользоваться ботом</b>\n\n"
         "• Напишите любое сообщение — я отвечу.\n"
+        "• 🎧 Озвучивай ответы: нажми кнопку «Озвучить» под сообщением.\n"
+        "• 📄 Отправляй документы (.txt, .md, .csv, .pdf) — сделаю краткое резюме.\n"
+        "• 📷 Присылай фото или скриншоты — опишу, что на них.\n"
         "• Нужна картинка? Команда /img.\n"
         "• Выбор модели — /models.\n"
         "• Переключить режим — /mode.\n"
@@ -1205,6 +1214,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "<b>Как пользоваться ботом</b>\n\n"
         "• Напишите любое сообщение — я отвечу.\n"
+        "• 🎧 Озвучивай ответы: нажми кнопку «Озвучить» под сообщением.\n"
+        "• 📄 Отправляй документы (.txt, .md, .csv, .pdf) — я сделаю краткое резюме.\n"
+        "• 📷 Присылай фото или скриншоты — расскажу, что на них.\n"
         "• Нужна картинка? Команда /img.\n"
         "• Выбор модели — /models.\n"
         "• Переключить режим — /mode.\n"
@@ -1220,12 +1232,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
 
-        # Переименование чата — если ждём от пользователя новое имя
+    # Переименование чата — если ждём от пользователя новое имя
     if _pending_chat_rename.get(user_id):
         cid = _pending_chat_rename[user_id]
         new_title = (text or "").strip()[:80]
         if not new_title:
-            await update.message.reply_text("Название пустое. Отправьте текст от 1 до 80 символов или нажмите «Отмена» в меню.")
+            await update.message.reply_text(
+                "Название пустое. Отправьте текст от 1 до 80 символов или нажмите «Отмена» в меню."
+            )
             return
         ok = await rename_chat(user_id, cid, new_title)
         _pending_chat_rename.pop(user_id, None)
@@ -1241,7 +1255,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_premium(user_id):
             await update.message.reply_text(
                 "Генерация изображений только для Премиум.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Купить подписку", callback_data="buy")]])
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Купить подписку", callback_data="buy")]]
+                ),
             )
             return
         await update.message.reply_text("Генерирую изображение…")
@@ -1265,59 +1281,58 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # выбор по диалоговому режиму
     mode = await get_chat_mode(user_id)
-    if mode == DIALOG_ROOMS:
-        # нужен активный чат, если нет — создадим
-        cid = await get_active_chat(user_id)
-        if cid is None:
-            cid = await create_chat(user_id, "Чат 1")
-            await set_active_chat(user_id, cid)
 
-        # загрузим историю (последние 20 сообщений) + добавим текущий запрос
-        history = await get_chat_history(cid, limit=20)
-        reply = ask_llm_context(user_id, history, text)
+    # ➊ Поставим временное сообщение
+    spinner = await update.message.reply_text("🤖 Генерация ответа…")
 
-        # сохраним и вопрос, и ответ в историю
-        await add_chat_message(cid, "user", text)
-        await add_chat_message(cid, "assistant", reply)
+    try:
+        if mode == DIALOG_ROOMS:
+            # нужен активный чат, если нет — создадим
+            cid = await get_active_chat(user_id)
+            if cid is None:
+                cid = await create_chat(user_id, "Чат 1")
+                await set_active_chat(user_id, cid)
 
-        # постраничная отправка длинного ответа
-        _last_answer[user_id] = reply
-        parts = _split_for_telegram(reply)
-        if len(parts) == 1:
-            # короткий ответ: сразу даём «Озвучить»
-            _last_answer[user_id] = parts[0]
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
-            await update.message.reply_text(parts[0], reply_markup=kb)
+            # загрузим историю (последние 20 сообщений) + добавим текущий запрос
+            history = await get_chat_history(cid, limit=20)
+            reply = ask_llm_context(user_id, history, text)
+
+            # сохраним и вопрос, и ответ в историю
+            await add_chat_message(cid, "user", text)
+            await add_chat_message(cid, "assistant", reply)
         else:
-            # длинный ответ: две кнопки на первой части
-            _long_reply_queue[user_id] = parts[1:]
-            _last_answer[user_id] = parts[0]  # озвучивать будем текущий показанный кусок
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
-                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
-            ])
-            await update.message.reply_text(parts[0], reply_markup=kb)
-        return
+            # быстрый режим
+            reply = ask_llm(user_id, text)
+    finally:
+        # ➋ Удаляем «спиннер» в любом исходе
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=spinner.message_id,
+            )
+        except Exception:
+            pass
+
+    # ➌ Отправляем ответ (кнопки как обсуждали)
+    _last_answer[user_id] = reply
+    parts = _split_for_telegram(reply)
+    if len(parts) == 1:
+        _last_answer[user_id] = parts[0]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+        await update.message.reply_text(parts[0], reply_markup=kb)
     else:
-        # быстрый режим (как раньше)
-        reply = ask_llm(user_id, text)
-        _last_answer[user_id] = reply
-        parts = _split_for_telegram(reply)
-        if len(parts) == 1:
-            # короткий ответ: сразу даём «Озвучить»
-            _last_answer[user_id] = parts[0]
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
-            await update.message.reply_text(parts[0], reply_markup=kb)
-        else:
-            # длинный ответ: две кнопки на первой части
-            _long_reply_queue[user_id] = parts[1:]
-            _last_answer[user_id] = parts[0]  # озвучивать будем текущий показанный кусок
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
-                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
-            ])
-            await update.message.reply_text(parts[0], reply_markup=kb)
-        return
+        _long_reply_queue[user_id] = parts[1:]
+        _last_answer[user_id] = parts[0]
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+                    InlineKeyboardButton("🎧 Озвучить", callback_data="tts"),
+                ]
+            ]
+        )
+        await update.message.reply_text(parts[0], reply_markup=kb)
+    return
 
 
 # =========================
@@ -1340,6 +1355,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+    spinner = await update.message.reply_text("🤖 Генерация ответа…")
     try:
         # берём самую большую превьюху
         photo = update.message.photo[-1]
@@ -1348,22 +1364,35 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # если у сообщения есть подпись — используем как hint
         hint = update.message.caption or ""
         reply = _analyze_image_with_llm(user_id, hint, img64)
-
-        _last_answer[user_id] = reply
-        chunks = _split_for_telegram(reply)
-        if len(chunks) > 1:
-            _long_reply_queue[user_id] = chunks[1:]
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
-                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
-            ])
-            await update.message.reply_text(chunks[0], reply_markup=kb)
-        else:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
-            await update.message.reply_text(chunks[0], reply_markup=kb)
     except Exception as e:
         await update.message.reply_text(f"Не удалось проанализировать изображение: {e}")
+        return
+    finally:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=spinner.message_id,
+            )
+        except Exception:
+            pass
 
+    _last_answer[user_id] = reply
+    chunks = _split_for_telegram(reply)
+    if len(chunks) > 1:
+        _long_reply_queue[user_id] = chunks[1:]
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+                    InlineKeyboardButton("🎧 Озвучить", callback_data="tts"),
+                ]
+            ]
+        )
+        await update.message.reply_text(chunks[0], reply_markup=kb)
+    else:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+        await update.message.reply_text(chunks[0], reply_markup=kb)
+        
 # =========================
 # Обработчик документов (.txt/.md/.csv/.pdf)
 # =========================
@@ -1387,6 +1416,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     doc = update.message.document
     title = doc.file_name or "документ"
+    spinner = await update.message.reply_text("🤖 Генерация ответа…")
     try:
         data = await _download_telegram_file(context.bot, doc.file_id)
         text_content = ""
@@ -1413,6 +1443,11 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         reply = _summarize_text_with_llm(user_id, title, text_content)
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id,
+                                            message_id=spinner.message_id)
+        except Exception:
+            pass
         _last_answer[user_id] = reply
         chunks = _split_for_telegram(reply)
         if len(chunks) > 1:
