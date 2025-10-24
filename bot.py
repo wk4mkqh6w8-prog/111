@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import base64
 import tempfile
 from pathlib import Path
-from PyPDF2 import PdfReader  # pip install PyPDF2
+from pypdf import PdfReader  # pip install PyPDF2
 
 import requests
 from dotenv import load_dotenv
