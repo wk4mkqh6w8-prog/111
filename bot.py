@@ -318,8 +318,8 @@ def _analyze_image_with_llm(user_id: int, hint: str, image_b64: str) -> str:
     msgs = [
         {"role": "system", "content": sys_text},
         {"role": "user", "content": [
-            {"type": "input_text", "text": hint or "Опиши что на фото и дай ключевые детали."},
-            {"type": "input_image", "image_url": {"url": image_b64}},
+            {"type": "text", "text": hint or "Опиши что на фото и дай ключевые детали."},
+            {"type": "image_url", "image_url": {"url": image_b64}},
         ]},
     ]
     r = oai.chat.completions.create(
