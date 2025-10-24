@@ -5,6 +5,11 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+import base64
+import tempfile
+from pathlib import Path
+from PyPDF2 import PdfReader  # pip install PyPDF2
+
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -55,6 +60,8 @@ _user_model_visual: dict[int, str] = {}  # «название модели» к�
 _user_model: dict[int, str] = {}         # фактический backend (OpenAI/DeepSeek)
 _awaiting_img_prompt: dict[int, bool] = {}
 _pending_chat_rename: dict[int, int] = {}  # user_id -> chat_id
+_last_answer: dict[int, str] = {}           # последний текстовый ответ для TTS
+_long_reply_queue: dict[int, list[str]] = {}  # очереди «показать ещё»
 
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
@@ -238,6 +245,134 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
         )
         return r.choices[0].message.content
 
+async def tts_and_send(user_id: int, chat_id: int, text: str, bot):
+    """
+    Озвучивает text через OpenAI TTS и отправляет голосовым.
+    Модель/голос — можно менять.
+    """
+    try:
+        # OpenAI TTS -> MP3
+        audio = oai.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=text[:4000]  # страхуемся от чрезмерно длинного
+        )
+        tmpdir = Path(tempfile.gettempdir())
+        fpath = tmpdir / f"tts_{user_id}_{int(time.time())}.mp3"
+        with open(fpath, "wb") as f:
+            f.write(audio.content)
+
+        await bot.send_voice(chat_id=chat_id, voice=str(fpath), caption="Озвучено 🎧")
+        try:
+            fpath.unlink(missing_ok=True)
+        except Exception:
+            pass
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text=f"Не вышло озвучить: {e}")
+
+async def on_tts_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    text = _last_answer.get(uid)
+    if not text:
+        await q.message.reply_text("Нет текста для озвучки.")
+        return
+    await tts_and_send(uid, q.message.chat_id, text, context.bot)
+
+# =========================
+# Хелперы для фото/доков
+# =========================
+async def _download_telegram_file(bot, file_id: str) -> bytes:
+    tg_file = await bot.get_file(file_id)
+    bio = tempfile.NamedTemporaryFile(delete=False)
+    try:
+        await tg_file.download_to_drive(custom_path=bio.name)
+        with open(bio.name, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            Path(bio.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+def _img_b64(data: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+def _summarize_text_with_llm(user_id: int, title: str, text: str) -> str:
+    prompt = (
+        f"Мне прислали документ «{title}». Сделай короткое резюме и извлеки ключевые пункты.\n\n"
+        f"Текст (обрезан до 8000 символов):\n{text[:8000]}"
+    )
+    return ask_llm(user_id, prompt)
+
+def _analyze_image_with_llm(user_id: int, hint: str, image_b64: str) -> str:
+    """
+    hint — что хочет пользователь (если пусто — 'опиши что на фото').
+    image_b64 — data:image/jpeg;base64,....
+    """
+    sys_text = TASK_MODES.get(_user_task_mode.get(user_id, "default"), TASK_MODES["default"])["system"]
+    msgs = [
+        {"role": "system", "content": sys_text},
+        {"role": "user", "content": [
+            {"type": "input_text", "text": hint or "Опиши что на фото и дай ключевые детали."},
+            {"type": "input_image", "image_url": {"url": image_b64}},
+        ]},
+    ]
+    r = oai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=msgs,
+        temperature=0.4,
+    )
+    return r.choices[0].message.content
+
+# =========================
+# Длинные ответы: нарезка и "Показать ещё"
+# =========================
+def _split_for_telegram(text: str, limit: int = 3500) -> list[str]:
+    """Режет длинные ответы по абзацам, чтобы не рвало середину текста."""
+    parts, buf = [], []
+    total = 0
+    for para in (text or "").split("\n"):
+        if total + len(para) + 1 > limit and buf:
+            parts.append("\n".join(buf))
+            buf, total = [], 0
+        buf.append(para)
+        total += len(para) + 1
+    if buf:
+        parts.append("\n".join(buf))
+    return parts if parts else [text]
+
+async def on_more_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет следующую часть длинного ответа или убирает кнопку, если частей больше нет."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    uid = q.from_user.id
+    queue = _long_reply_queue.get(uid) or []
+    if not queue:
+        # нечего слать — просто уберём кнопку
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    next_part = queue.pop(0)
+    _long_reply_queue[uid] = queue
+
+    # если части ещё остались — показываем кнопку ещё раз
+    kb = None
+    if queue:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё ▶️", callback_data="more")]])
+
+    await q.message.reply_text(next_part, reply_markup=kb)
 
 # ---------- Images (Replicate: Flux-1 Schnell) ----------
 def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024) -> list[str]:
@@ -1129,13 +1264,138 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await add_chat_message(cid, "user", text)
         await add_chat_message(cid, "assistant", reply)
 
-        await update.message.reply_text(reply)
+        # постраничная отправка длинного ответа
+        _last_answer[user_id] = reply
+        parts = _split_for_telegram(reply)
+        if len(parts) == 1:
+            await update.message.reply_text(parts[0])
+        else:
+            _long_reply_queue[user_id] = parts[1:]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё ▶️", callback_data="more")]])
+            await update.message.reply_text(parts[0], reply_markup=kb)
         return
     else:
         # быстрый режим (как раньше)
         reply = ask_llm(user_id, text)
-        await update.message.reply_text(reply)
+        _last_answer[user_id] = reply
+        parts = _split_for_telegram(reply)
+        if len(parts) == 1:
+            await update.message.reply_text(parts[0])
+        else:
+            _long_reply_queue[user_id] = parts[1:]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё ▶️", callback_data="more")]])
+            await update.message.reply_text(parts[0], reply_markup=kb)
         return
+
+
+# =========================
+# Обработчик фото
+# =========================
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # лимиты как в on_message
+    if not await is_premium(user_id):
+        if await can_send_message(user_id, limit=DAILY_LIMIT):
+            pass
+        elif await consume_free_credit(user_id):
+            pass
+        else:
+            await update.message.reply_text(
+                "🚫 Лимит исчерпан.\n"
+                f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+                f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
+                "Купите подписку «💳 Купить подписку» для безлимита."
+            )
+            return
+
+    try:
+        # берём самую большую превьюху
+        photo = update.message.photo[-1]
+        data = await _download_telegram_file(context.bot, photo.file_id)
+        img64 = _img_b64(data)
+        # если у сообщения есть подпись — используем как hint
+        hint = update.message.caption or ""
+        reply = _analyze_image_with_llm(user_id, hint, img64)
+
+        _last_answer[user_id] = reply
+        chunks = _split_for_telegram(reply)
+        if len(chunks) > 1:
+            _long_reply_queue[user_id] = chunks[1:]
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
+            ])
+            await update.message.reply_text(chunks[0], reply_markup=kb)
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+            await update.message.reply_text(chunks[0], reply_markup=kb)
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось проанализировать изображение: {e}")
+
+# =========================
+# Обработчик документов (.txt/.md/.csv/.pdf)
+# =========================
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # лимиты
+    if not await is_premium(user_id):
+        if await can_send_message(user_id, limit=DAILY_LIMIT):
+            pass
+        elif await consume_free_credit(user_id):
+            pass
+        else:
+            await update.message.reply_text(
+                "🚫 Лимит исчерпан.\n"
+                f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+                f"— Реферальные бонусы: получите +{REF_BONUS} заявок!\n\n"
+                "Купите подписку «💳 Купить подписку» для безлимита."
+            )
+            return
+
+    doc = update.message.document
+    title = doc.file_name or "документ"
+    try:
+        data = await _download_telegram_file(context.bot, doc.file_id)
+        text_content = ""
+        lower = (title or "").lower()
+
+        if lower.endswith((".txt", ".md", ".csv")):
+            # простые текстовые — читаем как utf-8
+            text_content = data.decode("utf-8", errors="replace")
+        elif lower.endswith(".pdf"):
+            import io
+            reader = PdfReader(io.BytesIO(data))
+            pages = min(10, len(reader.pages))  # не больше 10 страниц
+            chunks = []
+            for i in range(pages):
+                try:
+                    chunks.append(reader.pages[i].extract_text() or "")
+                except Exception:
+                    pass
+            text_content = "\n\n".join(chunks).strip()
+            if not text_content:
+                text_content = "[Не удалось извлечь текст из PDF. Попробуйте отправить как изображение/скриншот.]"
+        else:
+            await update.message.reply_text("Поддерживаю пока .txt, .md, .csv и .pdf. Попробуйте один из этих форматов.")
+            return
+
+        reply = _summarize_text_with_llm(user_id, title, text_content)
+        _last_answer[user_id] = reply
+        chunks = _split_for_telegram(reply)
+        if len(chunks) > 1:
+            _long_reply_queue[user_id] = chunks[1:]
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
+            ])
+            await update.message.reply_text(chunks[0], reply_markup=kb)
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+            await update.message.reply_text(chunks[0], reply_markup=kb)
+
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось обработать документ: {e}")
 
 # =========================
 # Админ-команды
@@ -1384,6 +1644,8 @@ def build_application() -> Application:
     # кнопка/команда генерации изображений
     app_.add_handler(CallbackQueryHandler(on_img_btn, pattern=r"^img$"))
     app_.add_handler(CommandHandler("img", cmd_img))
+    app_.add_handler(CallbackQueryHandler(on_tts_btn, pattern=r"^tts$"))
+    app_.add_handler(CallbackQueryHandler(on_more_btn, pattern=r"^more$"))
 
     # кнопки
     app_.add_handler(CallbackQueryHandler(on_buy_btn,      pattern=r"^buy$"))
@@ -1407,6 +1669,9 @@ def build_application() -> Application:
 
     # сообщения
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # вложения
+    app_.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, on_photo))
+    app_.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, on_document))
     
     # диалоговые режимы и чаты
     app_.add_handler(CallbackQueryHandler(on_dialog_btn,    pattern=r"^dialog$"))
@@ -1456,6 +1721,8 @@ async def on_shutdown():
             await application.shutdown()
     finally:
         logger.info("🛑 Shutdown complete")
+
+
 
 # =========================
 # Запуск
