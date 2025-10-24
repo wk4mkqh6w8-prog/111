@@ -9,6 +9,7 @@ import base64
 import tempfile
 from pathlib import Path
 from pypdf import PdfReader  # pip install PyPDF2
+from gtts import gTTS  # ← добавь импорт рядом с остальными
 
 import requests
 from dotenv import load_dotenv
@@ -247,22 +248,27 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
 
 async def tts_and_send(user_id: int, chat_id: int, text: str, bot):
     """
-    Озвучивает text через OpenAI TTS и отправляет голосовым.
-    Модель/голос — можно менять.
+    Озвучивает text через gTTS (бесплатно) и отправляет как аудио (MP3).
+    Если хочешь "voice"-сообщение (круглую плашку), позже можно
+    добавить конвертацию MP3 -> OGG/OPUS через ffmpeg/pydub.
     """
     try:
-        # OpenAI TTS -> MP3
-        audio = oai.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=text[:4000]  # страхуемся от чрезмерно длинного
-        )
+        # gTTS ограничений по квоте нет; режем текст на всякий случай
+        tts = gTTS(text=text[:4000], lang="ru")
         tmpdir = Path(tempfile.gettempdir())
         fpath = tmpdir / f"tts_{user_id}_{int(time.time())}.mp3"
-        with open(fpath, "wb") as f:
-            f.write(audio.content)
+        tts.save(str(fpath))
 
-        await bot.send_voice(chat_id=chat_id, voice=str(fpath), caption="Озвучено 🎧")
+        # Telegram «voice» требует OGG/OPUS, поэтому шлём как обычное аудио (MP3)
+        with open(fpath, "rb") as f:
+            await bot.send_audio(
+                chat_id=chat_id,
+                audio=f,
+                caption="Озвучено 🎧",
+                title="TTS",
+                filename=fpath.name,
+            )
+
         try:
             fpath.unlink(missing_ok=True)
         except Exception:
