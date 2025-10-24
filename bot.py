@@ -353,7 +353,7 @@ def _split_for_telegram(text: str, limit: int = 3500) -> list[str]:
     return parts if parts else [text]
 
 async def on_more_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет следующую часть длинного ответа или убирает кнопку, если частей больше нет."""
+    """Отправляет следующую часть длинного ответа и даёт кнопки 'Показать ещё' + 'Озвучить'."""
     q = update.callback_query
     try:
         await q.answer()
@@ -363,7 +363,7 @@ async def on_more_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     queue = _long_reply_queue.get(uid) or []
     if not queue:
-        # нечего слать — просто уберём кнопку
+        # нечего слать — просто уберём клавиатуру
         try:
             await q.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -373,10 +373,17 @@ async def on_more_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     next_part = queue.pop(0)
     _long_reply_queue[uid] = queue
 
-    # если части ещё остались — показываем кнопку ещё раз
-    kb = None
+    # важно: озвучиваем именно тот кусок, который сейчас показываем
+    _last_answer[uid] = next_part
+
+    # если ещё есть части — две кнопки, иначе оставим только «Озвучить»
     if queue:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё ▶️", callback_data="more")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+             InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
+        ])
+    else:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
 
     await q.message.reply_text(next_part, reply_markup=kb)
 
@@ -788,7 +795,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Помогать с кодом и объяснять ошибки\n"
         "• Переводить 🇷🇺↔️🇬🇧 тексты и документы\n"
         "• Генерировать идеи, резюме, описания и письма\n"
-        "• Создавать изображения по описанию 🖼️\n\n"
+        "• Создавать изображения по описанию 🖼️\n"
+        "• 🎧 <b>Озвучивать ответы голосом</b> — нажми кнопку «Озвучить» под сообщением\n"
+        "• 📄 <b>Работать с документами</b> (.txt, .md, .csv, .pdf): краткие выжимки и ключевые пункты\n"
+        "• 📷 <b>Понимать фотографии/скриншоты</b>: описание и извлечение важных деталей\n\n"
         "👇 Выбирай, с чего начать:"
     )
 
@@ -1274,10 +1284,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _last_answer[user_id] = reply
         parts = _split_for_telegram(reply)
         if len(parts) == 1:
-            await update.message.reply_text(parts[0])
+            # короткий ответ: сразу даём «Озвучить»
+            _last_answer[user_id] = parts[0]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+            await update.message.reply_text(parts[0], reply_markup=kb)
         else:
+            # длинный ответ: две кнопки на первой части
             _long_reply_queue[user_id] = parts[1:]
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё ▶️", callback_data="more")]])
+            _last_answer[user_id] = parts[0]  # озвучивать будем текущий показанный кусок
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
+            ])
             await update.message.reply_text(parts[0], reply_markup=kb)
         return
     else:
@@ -1286,10 +1304,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _last_answer[user_id] = reply
         parts = _split_for_telegram(reply)
         if len(parts) == 1:
-            await update.message.reply_text(parts[0])
+            # короткий ответ: сразу даём «Озвучить»
+            _last_answer[user_id] = parts[0]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+            await update.message.reply_text(parts[0], reply_markup=kb)
         else:
+            # длинный ответ: две кнопки на первой части
             _long_reply_queue[user_id] = parts[1:]
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё ▶️", callback_data="more")]])
+            _last_answer[user_id] = parts[0]  # озвучивать будем текущий показанный кусок
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+                 InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
+            ])
             await update.message.reply_text(parts[0], reply_markup=kb)
         return
 
