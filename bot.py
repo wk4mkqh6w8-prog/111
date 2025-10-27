@@ -31,6 +31,9 @@ load_dotenv()
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 OPENAI_KEY     = os.getenv("OPENAI_KEY", "")
+# Поддержка пула ключей: можно задать OPENAI_KEYS="sk-1,sk-2,sk-3"
+OPENAI_KEYS_RAW = os.getenv("OPENAI_KEYS", "")
+OPENAI_KEYS = [k.strip() for k in (OPENAI_KEYS_RAW or OPENAI_KEY or "").split(",") if k and k.strip()]
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_KEY", "")
 CRYPTOPAY_KEY  = os.getenv("CRYPTOPAY_KEY", "")
 REPLICATE_KEY  = os.getenv("REPLICATE_KEY", "")
@@ -42,8 +45,8 @@ SUPPORT_WORK_HOURS = os.getenv("SUPPORT_WORK_HOURS", "10:00–19:00 MSK")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN пуст")
-if not OPENAI_KEY:
-    raise RuntimeError("OPENAI_KEY пуст")
+if not OPENAI_KEYS:
+    raise RuntimeError("OPENAI_KEYS/OPENAI_KEY пуст")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,8 +114,69 @@ TASK_MODES = {
 }
 _user_task_mode: dict[int, str] = {}  # хранит ключ режима пользователя
 
-# OpenAI клиент
-oai = OpenAI(api_key=OPENAI_KEY)
+# ----- OpenAI clients pool + failover logic -----
+from collections import deque
+
+_oai_clients: dict[str, OpenAI] = {}
+_openai_keys_ring = deque(OPENAI_KEYS)
+_key_cooldowns: dict[str, float] = {}   # key -> unix_timestamp до какого молчим
+
+def _get_client(api_key: str) -> OpenAI:
+    cli = _oai_clients.get(api_key)
+    if cli is None:
+        cli = OpenAI(api_key=api_key)
+        _oai_clients[api_key] = cli
+    return cli
+
+def _mark_cooldown(api_key: str, seconds: int):
+    _key_cooldowns[api_key] = time.time() + max(1, seconds)
+
+def _pick_next_key() -> str | None:
+    """Берём следующий ключ, который не на кулдауне."""
+    if not _openai_keys_ring:
+        return None
+    now = time.time()
+    for _ in range(len(_openai_keys_ring)):
+        k = _openai_keys_ring[0]
+        _openai_keys_ring.rotate(-1)
+        if _key_cooldowns.get(k, 0) <= now:
+            return k
+    return None  # все в кулдауне
+
+def _oai_chat_call(messages: list[dict], model: str, temperature: float = 0.7) -> str:
+    """
+    Вызывает chat.completions с автоматическим переключением ключей.
+    Возвращает текст ответа или кидает RuntimeError, если все ключи не сработали.
+    """
+    last_err: Exception | None = None
+    tried: set[str] = set()
+
+    for _ in range(len(OPENAI_KEYS)):
+        api_key = _pick_next_key()
+        if not api_key or api_key in tried:
+            break
+        tried.add(api_key)
+        client = _get_client(api_key)
+        try:
+            r = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+            return r.choices[0].message.content
+        except Exception as e:
+            # классифицируем и ставим разумный кулдаун
+            status = getattr(e, "status_code", None)
+            if status == 401:          # невалидный/отключённый ключ
+                _mark_cooldown(api_key, 600)
+            elif status in (429, 500, 503):
+                _mark_cooldown(api_key, 60)    # лимит/перегруз/апстрим
+            else:
+                _mark_cooldown(api_key, 10)
+            last_err = e
+            continue
+
+    raise RuntimeError(f"All OpenAI keys failed: {last_err!s}")
 
 # =========================
 # DB helpers
@@ -159,12 +223,8 @@ def _compose_prompt(user_id: int, user_text: str) -> list[dict]:
 
 def _ask_openai(user_id: int, prompt: str) -> str:
     msgs = _compose_prompt(user_id, prompt)
-    r = oai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=msgs,
-        temperature=0.7,
-    )
-    return r.choices[0].message.content
+    # используем failover wrapper
+    return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.7)
 
 def _ask_deepseek(user_id: int, prompt: str) -> str:
     if not DEEPSEEK_KEY:
@@ -239,12 +299,9 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
             return f"Ошибка DeepSeek: {e!s}"
     else:
         # OpenAI
-        r = oai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=msgs,
-            temperature=0.7,
-        )
-        return r.choices[0].message.content
+        # Используем общий вызов с переключением ключей
+        return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.7)
+
 
 async def tts_and_send(user_id: int, chat_id: int, text: str, bot):
     """
@@ -328,12 +385,7 @@ def _analyze_image_with_llm(user_id: int, hint: str, image_b64: str) -> str:
             {"type": "image_url", "image_url": {"url": image_b64}},
         ]},
     ]
-    r = oai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=msgs,
-        temperature=0.4,
-    )
-    return r.choices[0].message.content
+    return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.4)
 
 # =========================
 # Длинные ответы: нарезка и "Показать ещё"
@@ -1392,7 +1444,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
         await update.message.reply_text(chunks[0], reply_markup=kb)
-        
+
 # =========================
 # Обработчик документов (.txt/.md/.csv/.pdf)
 # =========================
