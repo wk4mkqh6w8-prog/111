@@ -42,6 +42,7 @@ PORT           = int(os.getenv("PORT", "10000"))
 SUPPORT_EMAIL      = os.getenv("SUPPORT_EMAIL", "support@neurobotgpt.ru")
 PUBLIC_OFFER_URL   = os.getenv("PUBLIC_OFFER_URL", "https://disk.yandex.ru/i/wdHQVfYcJGjwhw")
 SUPPORT_WORK_HOURS = os.getenv("SUPPORT_WORK_HOURS", "10:00–19:00 MSK")
+PHOTO_COOLDOWN_SEC = int(os.getenv("PHOTO_COOLDOWN_SEC", "60"))  # КД на фото для всех, сек
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN пуст")
@@ -66,6 +67,7 @@ _awaiting_img_prompt: dict[int, bool] = {}
 _pending_chat_rename: dict[int, int] = {}  # user_id -> chat_id
 _last_answer: dict[int, str] = {}           # последний текстовый ответ для TTS
 _long_reply_queue: dict[int, list[str]] = {}  # очереди «показать ещё»
+_photo_cd_until: dict[int, float] = {}  # user_id -> unix timestamp до которого фото нельзя слать
 
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
@@ -1392,6 +1394,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+        # --- КД на отправку фото (для всех, включая премиум) ---
+    now = time.time()
+    until = _photo_cd_until.get(user_id, 0)
+    if until > now:
+        left = int(until - now)
+        await update.message.reply_text(f"⏳ Подождите {left} сек. перед следующей фотографией.")
+        return
+    # ставим новый КД сразу, чтобы не спамили даже при ошибке
+    _photo_cd_until[user_id] = now + PHOTO_COOLDOWN_SEC
     # лимиты как в on_message
     if not await is_premium(user_id):
         if await can_send_message(user_id, limit=DAILY_LIMIT):
