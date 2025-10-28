@@ -123,6 +123,11 @@ _oai_clients: dict[str, OpenAI] = {}
 _openai_keys_ring = deque(OPENAI_KEYS)
 _key_cooldowns: dict[str, float] = {}   # key -> unix_timestamp до какого молчим
 
+from collections import deque
+
+_recent_updates = deque(maxlen=1000)
+_recent_set = set()
+
 def _get_client(api_key: str) -> OpenAI:
     cli = _oai_clients.get(api_key)
     if cli is None:
@@ -1601,6 +1606,19 @@ async def telegram_webhook(request: Request):
         return {"ok": False, "error": "bot not initialized"}
     data = await request.json()
     update = Update.de_json(data, application.bot)
+    uid = update.update_id
+    if uid in _recent_set:
+        return {"ok": True}  # уже обрабатывали
+    _recent_updates.append(uid)
+    _recent_set.add(uid)
+    if len(_recent_updates) == _recent_updates.maxlen:
+    # чистим множество, когда очередь заполнена
+        try:
+            while len(_recent_set) > _recent_updates.maxlen:
+                _recent_set.remove(_recent_updates.popleft())
+        except Exception:
+            _recent_set.clear()
+            _recent_set.update(_recent_updates)
     await application.process_update(update)
     return {"ok": True}
 
