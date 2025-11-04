@@ -4,11 +4,13 @@ import hmac
 import logging
 import asyncio
 import hashlib
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
 
 import base64
+import shutil
 import tempfile
 from pathlib import Path
 from pypdf import PdfReader  # pip install PyPDF2
@@ -316,34 +318,83 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
 
 
 async def tts_and_send(user_id: int, chat_id: int, text: str, bot):
-    """
-    Озвучивает text через gTTS (бесплатно) и отправляет как аудио (MP3).
-    Если хочешь "voice"-сообщение (круглую плашку), позже можно
-    добавить конвертацию MP3 -> OGG/OPUS через ffmpeg/pydub.
-    """
+    """Озвучивает text через gTTS и пытается отправить голосовое (OPUS)."""
+    tmpdir = Path(tempfile.gettempdir())
+    mp3_path = tmpdir / f"tts_{user_id}_{int(time.time())}.mp3"
+    ogg_path = mp3_path.with_suffix(".ogg")
+
     try:
         # gTTS ограничений по квоте нет; режем текст на всякий случай
         tts = gTTS(text=text[:4000], lang="ru")
-        tmpdir = Path(tempfile.gettempdir())
-        fpath = tmpdir / f"tts_{user_id}_{int(time.time())}.mp3"
-        tts.save(str(fpath))
+        tts.save(str(mp3_path))
 
-        # Telegram «voice» требует OGG/OPUS, поэтому шлём как обычное аудио (MP3)
-        with open(fpath, "rb") as f:
-            await bot.send_audio(
-                chat_id=chat_id,
-                audio=f,
-                caption="Озвучено 🎧",
-                title="TTS",
-                filename=fpath.name,
-            )
-
+        sent_voice = False
         try:
-            fpath.unlink(missing_ok=True)
-        except Exception:
-            pass
+            if await _convert_mp3_to_ogg(mp3_path, ogg_path):
+                with open(ogg_path, "rb") as voice_file:
+                    await bot.send_voice(
+                        chat_id=chat_id,
+                        voice=voice_file,
+                        caption="Озвучено 🎧",
+                    )
+                sent_voice = True
+        except Exception as convert_err:
+            logger.warning("TTS voice conversion failed: %s", convert_err)
+
+        if not sent_voice:
+            # Fallback: отправляем MP3 как обычное аудио.
+            with open(mp3_path, "rb") as audio_file:
+                await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=audio_file,
+                    caption="Озвучено 🎧",
+                    title="TTS",
+                    filename=mp3_path.name,
+                )
     except Exception as e:
         await bot.send_message(chat_id=chat_id, text=f"Не вышло озвучить: {e}")
+    finally:
+        for path in (mp3_path, ogg_path):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+async def _convert_mp3_to_ogg(mp3_path: Path, ogg_path: Path) -> bool:
+    """
+    Конвертирует MP3 в OGG/OPUS через ffmpeg (если доступен).
+    Возвращает True при успехе.
+    """
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return False
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(mp3_path),
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "48k",
+        "-vbr",
+        "on",
+        str(ogg_path),
+    ]
+
+    def _run_ffmpeg():
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    proc = await asyncio.to_thread(_run_ffmpeg)
+    return proc.returncode == 0 and ogg_path.exists()
 
 async def on_tts_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
