@@ -18,6 +18,7 @@ from pypdf import PdfReader  # pip install PyPDF2
 from gtts import gTTS  # ← добавь импорт рядом с остальными
 from pptx import Presentation
 from pptx.util import Pt
+from pptx.dml.color import RGBColor
 
 import httpx
 import requests
@@ -526,35 +527,105 @@ def _parse_slides_from_text(raw: str, topic: str) -> list[dict[str, list[str]]]:
 
     return slides[:8]
 
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_json_array(raw: str) -> list | None:
+    """Пытаемся вытащить JSON-массив из сырого текста."""
+    if not raw:
+        return None
+
+    def _try_load(candidate: str):
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    direct = _try_load(raw)
+    if direct is not None:
+        return direct
+
+    for match in _JSON_BLOCK_RE.finditer(raw):
+        block = match.group(1)
+        parsed = _try_load(block)
+        if parsed is not None:
+            return parsed
+
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        parsed = _try_load(raw[start:end + 1])
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def _normalize_slide(item: dict, idx: int, topic: str) -> dict[str, list[str]]:
+    title = str(item.get("title", "")).strip()
+    if not title:
+        title = f"Раздел {idx}"
+    title = title[:120]
+
+    bullets_raw = item.get("bullets")
+    if isinstance(bullets_raw, str):
+        bullets_iter = [bullets_raw]
+    elif isinstance(bullets_raw, list):
+        bullets_iter = bullets_raw
+    else:
+        bullets_iter = []
+
+    bullets: list[str] = []
+    for b in bullets_iter:
+        if not b:
+            continue
+        bullet = str(b)
+        bullet = re.sub(r"^\s*(?:[-*•]|\d+[.)-])\s*", "", bullet)
+        bullet = bullet.strip()
+        if not bullet:
+            continue
+        bullets.append(bullet[:200])
+
+    if not bullets:
+        bullets = ["(добавьте заметки сами)"]
+
+    return {"title": title, "bullets": bullets[:5]}
+
+
 def _generate_presentation_structure(user_id: int, topic: str) -> list[dict[str, list[str]]]:
     prompt = (
-        "Составь краткую структуру презентации по теме ниже. Верни строго JSON-массив, "
-        "каждый элемент — объект вида {\"title\": \"...\", \"bullets\": [\"...\"]}. "
-        "5–7 слайдов: вступление, 3-4 основного материала, финал. "
-        "В каждом слайде не больше 5 буллетов, формулируй их коротко (до 15 слов). "
-        f"Тема: {topic!r}"
+        "Составь краткую структуру презентации по указанной теме. "
+        "Ответь ТОЛЬКО валидным JSON-массивом без префиксов и комментариев. "
+        "Формат элемента: {\"title\": \"Название слайда\", \"bullets\": [\"Пункт 1\", \"Пункт 2\"]}. "
+        "Нужно 5–7 слайдов: вводный, 3-4 основных, финальный вывод. "
+        "Пункты делай короткими (до 15 слов), без номеров и маркеров."
+        f"\nТема: {topic!r}"
     )
     raw = ask_llm(user_id, prompt)
-    slides: list[dict[str, list[str]]] = []
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                title = str(item.get("title", "")).strip() or topic
-                bullets = item.get("bullets") or []
-                if isinstance(bullets, str):
-                    bullets = [bullets]
-                clean_bullets = [str(b).strip()[:200] for b in bullets if str(b).strip()]
-                slides.append({"title": title[:120], "bullets": clean_bullets[:5] or ["(пусто)"]})
-    except Exception:
-        slides = []
+    slides_data: list[dict[str, list[str]]] = []
 
-    if not slides:
-        slides = _parse_slides_from_text(raw, topic)
+    data = _extract_json_array(raw)
+    if data:
+        idx = 1
+        for item in data:
+            if isinstance(item, dict):
+                slides_data.append(_normalize_slide(item, idx, topic))
+                idx += 1
 
-    return slides[:8]
+    if not slides_data:
+        parsed = _parse_slides_from_text(raw, topic)
+        slides_data = [
+            _normalize_slide(item, idx, topic)
+            for idx, item in enumerate(parsed, start=1)
+        ]
+
+    return slides_data[:8]
 
 def _build_presentation_file(slides: list[dict[str, list[str]]], path: Path, topic: str):
     prs = Presentation()
@@ -562,10 +633,22 @@ def _build_presentation_file(slides: list[dict[str, list[str]]], path: Path, top
     title_layout = prs.slide_layouts[0]
     title_slide = prs.slides.add_slide(title_layout)
     if title_slide.shapes.title:
-        title_slide.shapes.title.text = topic
+        title_tf = title_slide.shapes.title.text_frame
+        title_tf.clear()
+        title_para = title_tf.paragraphs[0]
+        title_para.text = topic
+        if title_para.font:
+            title_para.font.size = Pt(48)
+            title_para.font.bold = True
     try:
         subtitle = title_slide.placeholders[1]
-        subtitle.text = "Сгенерировано NeuroBot 🤖"
+        subtitle_tf = subtitle.text_frame
+        subtitle_tf.clear()
+        para = subtitle_tf.paragraphs[0]
+        para.text = "Сгенерировано NeuroBot 🤖"
+        if para.font:
+            para.font.size = Pt(20)
+            para.font.color.rgb = RGBColor(120, 120, 120)
     except Exception:
         pass
 
@@ -573,19 +656,32 @@ def _build_presentation_file(slides: list[dict[str, list[str]]], path: Path, top
     for idx, slide_data in enumerate(slides, start=1):
         slide = prs.slides.add_slide(content_layout)
         if slide.shapes.title:
-            slide.shapes.title.text = slide_data.get("title") or f"Слайд {idx}"
+            title_tf = slide.shapes.title.text_frame
+            title_tf.clear()
+            title_para = title_tf.paragraphs[0]
+            title_para.text = slide_data.get("title") or f"Слайд {idx}"
+            if title_para.font:
+                title_para.font.size = Pt(36)
+                title_para.font.bold = True
         try:
             text_frame = slide.shapes.placeholders[1].text_frame
         except Exception:
             continue
         text_frame.clear()
+        text_frame.word_wrap = True
+        text_frame.margin_left = Pt(10)
+        text_frame.margin_right = Pt(10)
+        text_frame.margin_top = Pt(5)
+        text_frame.margin_bottom = Pt(5)
         bullets = slide_data.get("bullets") or []
         for bullet_idx, bullet in enumerate(bullets):
             paragraph = text_frame.paragraphs[0] if bullet_idx == 0 else text_frame.add_paragraph()
             paragraph.text = bullet
             paragraph.level = 0
             if paragraph.font:
-                paragraph.font.size = Pt(24)
+                size = 26 if len(bullets) <= 4 else 22
+                paragraph.font.size = Pt(size)
+                paragraph.font.bold = False
 
     prs.save(str(path))
 
