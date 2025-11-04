@@ -139,7 +139,11 @@ PROFILE_THEME_INSTRUCTIONS = {
 }
 
 QUICK_COMMANDS_KEYBOARD = ReplyKeyboardMarkup(
-    [["/help", "/img"], ["/ppt", "/favorites"], ["/settings"]],
+    [
+        ["Выбрать модель", "Картинка", "Презентация"],
+        ["Режимы", "Диалоги", "Шаблоны"],
+        ["Помощь", "Настройки"],
+    ],
     resize_keyboard=True,
     selective=True,
 )
@@ -2367,7 +2371,7 @@ async def on_help_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📄 Отправляй документы (.txt, .md, .csv, .pdf) — сделаю краткое резюме.\n"
         "• 📷 Присылай фото или скриншоты — опишу, что на них.\n"
         "• Нужна картинка? Команда /img.\n"
-        "• 🗂️ Генерируй презентации — /ppt <тема>.\n"
+        "• 🗂️ Генерируй презентации — /ppt тема.\n"
         "• Выбор модели — /models.\n"
         "• Переключить режим — /mode.\n"
         "• Профиль и рефералка — /profile, /ref.\n"
@@ -2541,7 +2545,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📄 Отправляй документы (.txt, .md, .csv, .pdf) — я сделаю краткое резюме.\n"
         "• 📷 Присылай фото или скриншоты — расскажу, что на них.\n"
         "• Нужна картинка? Команда /img.\n"
-        "• 🗂️ Генерируй презентации — /ppt <тема>.\n"
+        "• 🗂️ Генерируй презентации — /ppt тема.\n"
         "• Выбор модели — /models.\n"
         "• Переключить режим — /mode.\n"
         "• Профиль и рефералка — /profile, /ref.\n"
@@ -2556,8 +2560,8 @@ async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args).strip() if context.args else ""
     if not topic:
         await update.message.reply_text(
-            "Использование: /ppt <тема/задача>.\n"
-            "Например: /ppt маркетинговая стратегия для нового продукта."
+            "Использование: /ppt тема или задача.\n"
+            'Например: /ppt маркетинговая стратегия для нового продукта.'
         )
         return
 
@@ -2630,6 +2634,39 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await _ensure_profile(user_id)
+
+    normalized = text.strip().lower()
+    if normalized in ("выбрать модель", "модель", "models"):
+        await cmd_models(update, context)
+        return
+    if normalized in ("картинка", "image"):
+        await cmd_img(update, context)
+        return
+    if normalized in ("презентация", "ppt", "deck"):
+        await update.message.reply_text(
+            "Введите команду вида /ppt тема, например: /ppt маркетинговая стратегия нового продукта."
+        )
+        return
+    if normalized in ("режимы", "режим", "modes"):
+        await cmd_mode(update, context)
+        return
+    if normalized in ("диалоги", "диалог", "dialogs", "chats"):
+        mode = await get_chat_mode(user_id)
+        await update.message.reply_text(
+            dialog_menu_text(mode),
+            parse_mode="HTML",
+            reply_markup=dialog_keyboard(mode),
+        )
+        return
+    if normalized in ("шаблоны", "избранное", "favorites"):
+        await cmd_favorites(update, context)
+        return
+    if normalized in ("помощь", "help"):
+        await cmd_help(update, context)
+        return
+    if normalized in ("настройки", "settings"):
+        await cmd_settings(update, context)
+        return
 
     # Переименование чата — если ждём от пользователя новое имя
     if _pending_chat_rename.get(user_id):
