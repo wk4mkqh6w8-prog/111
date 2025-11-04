@@ -8,6 +8,9 @@ import subprocess
 import threading
 import time
 import re
+import html
+import textwrap
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 import base64
@@ -26,10 +29,12 @@ import httpx
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
+from fpdf import FPDF
 
 from openai import OpenAI
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, ApplicationBuilder,
     CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -80,6 +85,89 @@ _pending_chat_rename: dict[int, int] = {}  # user_id -> chat_id
 _last_answer: dict[int, str] = {}           # последний текстовый ответ для TTS
 _long_reply_queue: dict[int, list[str]] = {}  # очереди «показать ещё»
 _photo_cd_until: dict[int, float] = {}  # user_id -> unix timestamp до которого фото нельзя слать
+_user_profiles: dict[int, dict[str, str]] = {}
+_last_user_prompt: dict[int, str] = {}
+
+PROFILE_STYLES = {
+    "standard": "Стандарт",
+    "friendly": "Дружелюбный",
+    "formal": "Официальный",
+    "expert": "Экспертный",
+}
+
+PROFILE_STYLE_INSTRUCTIONS = {
+    "standard": "",
+    "friendly": "Adopt a warm, encouraging tone and add light emoji where it improves clarity.",
+    "formal": "Use a formal, professional tone with complete sentences.",
+    "expert": "Respond like a subject-matter expert, referencing best practices and terminology.",
+}
+
+PROFILE_LANGUAGES = {
+    "auto": "Авто",
+    "ru": "Русский",
+    "en": "English",
+}
+
+PROFILE_LANGUAGE_INSTRUCTIONS = {
+    "auto": "Match the user's language. If unsure, default to Russian.",
+    "ru": "Respond in Russian.",
+    "en": "Respond in English.",
+}
+
+PROFILE_FORMATS = {
+    "plain": "Обычный текст",
+    "bullets": "Списки",
+    "markdown": "Markdown",
+}
+
+PROFILE_FORMAT_INSTRUCTIONS = {
+    "plain": "",
+    "bullets": "Format the answer as concise bullet points.",
+    "markdown": "Use clear Markdown formatting with headings and lists where helpful.",
+}
+
+PROFILE_THEMES = {
+    "auto": "Авто",
+    "light": "Светлая карточка",
+    "dark": "Тёмная карточка",
+}
+
+PROFILE_THEME_INSTRUCTIONS = {
+    "auto": "",
+    "light": "Keep the tone upbeat and add a short positive closing.",
+    "dark": "Use a slightly more atmospheric tone suitable for dark UI cards.",
+}
+
+QUICK_COMMANDS_KEYBOARD = ReplyKeyboardMarkup(
+    [["/help", "/img"], ["/ppt", "/favorites"], ["/settings"]],
+    resize_keyboard=True,
+    selective=True,
+)
+
+
+async def _ensure_profile(user_id: int) -> dict[str, str]:
+    profile = _user_profiles.get(user_id)
+    if profile is None:
+        profile = await get_user_profile_settings(user_id)
+        _user_profiles[user_id] = profile
+    return profile
+
+
+def _profile_snapshot(user_id: int) -> dict[str, str]:
+    profile = _user_profiles.get(user_id)
+    if not profile:
+        return dict(DEFAULT_PROFILE)
+    return {
+        "style": profile.get("style", DEFAULT_PROFILE["style"]),
+        "language": profile.get("language", DEFAULT_PROFILE["language"]),
+        "output_format": profile.get("output_format", DEFAULT_PROFILE["output_format"]),
+        "theme": profile.get("theme", DEFAULT_PROFILE["theme"]),
+    }
+
+
+def _update_profile_cache(user_id: int, field: str, value: str):
+    profile = _user_profiles.setdefault(user_id, dict(DEFAULT_PROFILE))
+    profile[field] = value
 
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
@@ -209,7 +297,11 @@ from db import (  # noqa
     # новые:
     get_chat_mode, set_chat_mode, create_chat, list_chats,
     set_active_chat, get_active_chat, add_chat_message, get_chat_history,
-    rename_chat, delete_chat
+    rename_chat, delete_chat,
+    get_user_profile_settings, set_user_profile_value, DEFAULT_PROFILE,
+    add_favorite_prompt, list_favorite_prompts, get_favorite_prompt, delete_favorite_prompt,
+    set_chat_pinned, create_chat_share, get_chat_share, cleanup_chat_shares,
+    get_chat_history_all
 )
 
 # =========================
@@ -232,17 +324,39 @@ DIALOG_SIMPLE = "simple"  # Быстрые ответы (без памяти)
 DIALOG_ROOMS  = "rooms"   # Диалоги с контекстом (чаты)
 
 # ---------- LLM ----------
-def _compose_prompt(user_id: int, user_text: str) -> list[dict]:
-    """Собираем сообщения с учётом выбранного режима."""
+def _compose_prompt(user_id: int, user_text: str, profile: dict[str, str] | None = None) -> list[dict]:
+    """Собираем сообщения с учётом выбранного режима и профиля пользователя."""
     mode_key = _user_task_mode.get(user_id, "default")
     sys_text = TASK_MODES.get(mode_key, TASK_MODES["default"])["system"]
+
+    profile = profile or _profile_snapshot(user_id)
+    instructions: list[str] = []
+
+    style = profile.get("style", "standard")
+    language = profile.get("language", "auto")
+    output_format = profile.get("output_format", "plain")
+    theme = profile.get("theme", "auto")
+
+    if PROFILE_STYLE_INSTRUCTIONS.get(style):
+        instructions.append(PROFILE_STYLE_INSTRUCTIONS[style])
+    if PROFILE_LANGUAGE_INSTRUCTIONS.get(language):
+        instructions.append(PROFILE_LANGUAGE_INSTRUCTIONS[language])
+    if PROFILE_FORMAT_INSTRUCTIONS.get(output_format):
+        instructions.append(PROFILE_FORMAT_INSTRUCTIONS[output_format])
+    if PROFILE_THEME_INSTRUCTIONS.get(theme):
+        instructions.append(PROFILE_THEME_INSTRUCTIONS[theme])
+
+    if instructions:
+        sys_text = f"{sys_text} {' '.join(instructions)}"
+
     return [
         {"role": "system", "content": sys_text},
         {"role": "user", "content": user_text},
     ]
 
 def _ask_openai(user_id: int, prompt: str) -> str:
-    msgs = _compose_prompt(user_id, prompt)
+    profile = _profile_snapshot(user_id)
+    msgs = _compose_prompt(user_id, prompt, profile)
     # используем failover wrapper
     return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.7)
 
@@ -255,7 +369,7 @@ def _ask_deepseek(user_id: int, prompt: str) -> str:
         headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": "deepseek-chat",
-            "messages": _compose_prompt(user_id, prompt),
+            "messages": _compose_prompt(user_id, prompt, _profile_snapshot(user_id)),
             "temperature": 0.7,
         }
         with httpx.Client(timeout=30) as s:
@@ -293,6 +407,23 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
             msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": user_text})
 
+    profile = _profile_snapshot(user_id)
+    instructions: list[str] = []
+    style = profile.get("style")
+    language = profile.get("language")
+    output_format = profile.get("output_format")
+    theme = profile.get("theme")
+    if PROFILE_STYLE_INSTRUCTIONS.get(style):
+        instructions.append(PROFILE_STYLE_INSTRUCTIONS[style])
+    if PROFILE_LANGUAGE_INSTRUCTIONS.get(language):
+        instructions.append(PROFILE_LANGUAGE_INSTRUCTIONS[language])
+    if PROFILE_FORMAT_INSTRUCTIONS.get(output_format):
+        instructions.append(PROFILE_FORMAT_INSTRUCTIONS[output_format])
+    if PROFILE_THEME_INSTRUCTIONS.get(theme):
+        instructions.append(PROFILE_THEME_INSTRUCTIONS[theme])
+    if instructions:
+        msgs[0]["content"] = f"{msgs[0]['content']} {' '.join(instructions)}"
+
     real = _user_model.get(user_id, DEFAULT_MODEL)
     if real == MODEL_DEEPSEEK:
         # DeepSeek
@@ -320,6 +451,23 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
     else:
         # OpenAI
         # Используем общий вызов с переключением ключей
+        profile = _profile_snapshot(user_id)
+        instructions = []
+        style = profile.get("style")
+        language = profile.get("language")
+        output_format = profile.get("output_format")
+        theme = profile.get("theme")
+        if PROFILE_STYLE_INSTRUCTIONS.get(style, ""):
+            instructions.append(PROFILE_STYLE_INSTRUCTIONS[style])
+        if PROFILE_LANGUAGE_INSTRUCTIONS.get(language, ""):
+            instructions.append(PROFILE_LANGUAGE_INSTRUCTIONS[language])
+        if PROFILE_FORMAT_INSTRUCTIONS.get(output_format, ""):
+            instructions.append(PROFILE_FORMAT_INSTRUCTIONS[output_format])
+        if PROFILE_THEME_INSTRUCTIONS.get(theme, ""):
+            instructions.append(PROFILE_THEME_INSTRUCTIONS[theme])
+
+        if instructions:
+            msgs[0]["content"] = f"{msgs[0]['content']} {' '.join(instructions)}"
         return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.7)
 
 def _transcribe_audio_file_sync(path: Path) -> str:
@@ -485,7 +633,21 @@ def _analyze_image_with_llm(user_id: int, hint: str, image_b64: str) -> str:
     hint — что хочет пользователь (если пусто — 'опиши что на фото').
     image_b64 — data:image/jpeg;base64,....
     """
+    profile = _profile_snapshot(user_id)
     sys_text = TASK_MODES.get(_user_task_mode.get(user_id, "default"), TASK_MODES["default"])["system"]
+    instructions = []
+    style = profile.get("style")
+    language = profile.get("language")
+    theme = profile.get("theme")
+    if PROFILE_STYLE_INSTRUCTIONS.get(style):
+        instructions.append(PROFILE_STYLE_INSTRUCTIONS[style])
+    if PROFILE_LANGUAGE_INSTRUCTIONS.get(language):
+        instructions.append(PROFILE_LANGUAGE_INSTRUCTIONS[language])
+    if PROFILE_THEME_INSTRUCTIONS.get(theme):
+        instructions.append(PROFILE_THEME_INSTRUCTIONS[theme])
+    if instructions:
+        sys_text = f"{sys_text} {' '.join(instructions)}"
+
     msgs = [
         {"role": "system", "content": sys_text},
         {"role": "user", "content": [
@@ -931,15 +1093,21 @@ async def on_more_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _last_answer[uid] = next_part
 
     # если ещё есть части — две кнопки, иначе оставим только «Озвучить»
+    rows: list[list[InlineKeyboardButton]] = []
     if queue:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
-             InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]
+        rows.append([
+            InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+            InlineKeyboardButton("🎧 Озвучить", callback_data="tts"),
         ])
     else:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
+        rows.append([InlineKeyboardButton("🎧 Озвучить", callback_data="tts")])
+    rows.append([
+        InlineKeyboardButton("⭐ Шаблон", callback_data="fav:add"),
+        InlineKeyboardButton("🔁 Перевести", callback_data="quick:translate"),
+        InlineKeyboardButton("🧾 Сжать", callback_data="quick:summary"),
+    ])
 
-    await q.message.reply_text(next_part, reply_markup=kb)
+    await q.message.reply_text(next_part, reply_markup=InlineKeyboardMarkup(rows))
 
 # ---------- Images (Replicate: Flux-1 Schnell) ----------
 def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024) -> list[str]:
@@ -1045,6 +1213,313 @@ async def generate_image_and_send(user_id: int, chat_id: int, prompt: str, bot) 
         await bot.send_photo(chat_id=chat_id, photo=urls[0], caption="Готово ✅")
     except Exception as e:
         await bot.send_message(chat_id=chat_id, text=f"Ошибка генерации: {e}")
+
+# ---------- Favorites & Быстрые действия ----------
+
+def _short_title(text: str) -> str:
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return "Без названия"
+    return textwrap.shorten(cleaned, width=32, placeholder="…")
+
+
+async def _favorites_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    favs = await list_favorite_prompts(user_id)
+    if not favs:
+        text = (
+            "⭐ <b>Шаблоны</b>\n"
+            "У вас пока нет сохранённых подсказок.\n"
+            "Нажмите кнопку «⭐ Шаблон» под ответом, чтобы добавить текущий запрос в избранное."
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="home")]])
+        return text, kb
+
+    lines = ["⭐ <b>Шаблоны</b>\nВыберите действие:"]
+    rows: list[list[InlineKeyboardButton]] = []
+    for fid, title in favs[:10]:
+        short = _short_title(title)
+        rows.append([
+            InlineKeyboardButton(f"▶️ {short}", callback_data=f"fav:run:{fid}"),
+            InlineKeyboardButton("🗑️", callback_data=f"fav:del:{fid}"),
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="home")])
+    text = "\n".join(lines)
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text, kb = await _favorites_payload(user_id)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def on_favorites_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    text, kb = await _favorites_payload(q.from_user.id)
+    try:
+        await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def on_fav_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    prompt = _last_user_prompt.get(uid)
+    if not prompt:
+        await q.message.reply_text("Нет последнего запроса, нечего сохранить.", reply_markup=main_keyboard())
+        return
+    title = _short_title(prompt)
+    fav_id = await add_favorite_prompt(uid, title, prompt)
+    logger.info("Saved favorite prompt %s for %s", fav_id, uid)
+    await q.message.reply_text(f"⭐ Шаблон «{title}» сохранён. Откройте меню «⭐ Шаблоны», чтобы использовать его.", reply_markup=main_keyboard())
+
+
+async def on_fav_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    fav_id = int(q.data.split("fav:del:", 1)[-1])
+    ok = await delete_favorite_prompt(uid, fav_id)
+    if ok:
+        text, kb = await _favorites_payload(uid)
+        try:
+            await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await q.message.reply_text("Шаблон удалён.", reply_markup=main_keyboard())
+    else:
+        await q.message.reply_text("Не удалось удалить шаблон.", reply_markup=main_keyboard())
+
+
+async def on_fav_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer("Использую шаблон…")
+    except Exception:
+        pass
+    uid = q.from_user.id
+    fav_id = int(q.data.split("fav:run:", 1)[-1])
+    fav = await get_favorite_prompt(uid, fav_id)
+    if not fav:
+        await q.message.reply_text("Шаблон не найден.", reply_markup=main_keyboard())
+        return
+    _, prompt_text = fav
+    fake_update = SimpleNamespace(message=q.message, effective_user=q.from_user)
+    await _handle_text_request(fake_update, context, prompt_text)
+
+
+def _detect_translation_target(profile: dict[str, str], text: str) -> tuple[str, str]:
+    pref_lang = profile.get("language", "auto")
+    if pref_lang == "ru":
+        return "English", "английский язык"
+    if pref_lang == "en":
+        return "Russian", "русский язык"
+    if _CYRILLIC_RE.search(text):
+        return "English", "английский язык"
+    return "Russian", "русский язык"
+
+
+async def on_quick_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    text = _last_answer.get(uid)
+    if not text:
+        await q.message.reply_text("Нет текста для перевода.", reply_markup=main_keyboard())
+        return
+    await _ensure_profile(uid)
+    profile = _profile_snapshot(uid)
+    target_code, target_label = _detect_translation_target(profile, text)
+    prompt = (
+        f"Translate the text below into {target_code}. Respond with the translation only.\n\n{text}"
+        if target_code == "English"
+        else f"Переведи текст ниже на {target_label}. Передай только перевод без комментариев.\n\n{text}"
+    )
+    try:
+        translation = _oai_chat_call(
+            messages=[
+                {"role": "system", "content": "You are a precise translator."},
+                {"role": "user", "content": prompt},
+            ],
+            model="gpt-4o-mini",
+            temperature=0,
+        ).strip()
+    except Exception as e:
+        await q.message.reply_text(f"Не удалось перевести: {e}", reply_markup=main_keyboard())
+        return
+    label = "Перевод (EN)" if target_code == "English" else "Перевод (RU)"
+    await q.message.reply_text(f"{label}:\n{translation}", reply_markup=main_keyboard())
+
+
+async def on_quick_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    text = _last_answer.get(uid)
+    if not text:
+        await q.message.reply_text("Нет текста для сжатия.", reply_markup=main_keyboard())
+        return
+    await _ensure_profile(uid)
+    profile = _profile_snapshot(uid)
+    lang = profile.get("language", "auto")
+    if lang == "en":
+        prompt = f"Summarize the text below in 3-4 bullet points.\n\n{text}"
+    else:
+        prompt = f"Сделай краткое резюме текста ниже в 3–4 пунктах.\n\n{text}"
+    try:
+        summary = _oai_chat_call(
+            messages=[
+                {"role": "system", "content": "You create short helpful summaries."},
+                {"role": "user", "content": prompt},
+            ],
+            model="gpt-4o-mini",
+            temperature=0.2,
+        ).strip()
+    except Exception as e:
+        await q.message.reply_text(f"Не удалось создать резюме: {e}", reply_markup=main_keyboard())
+        return
+    await q.message.reply_text(f"🧾 Краткое резюме:\n{summary}", reply_markup=main_keyboard())
+
+# ---------- Настройки профиля ----------
+
+def _settings_text(profile: dict[str, str]) -> str:
+    return (
+        "⚙️ <b>Персональные настройки</b>\n\n"
+        f"• Стиль: <b>{PROFILE_STYLES.get(profile.get('style'), 'Стандарт')}</b>\n"
+        f"• Язык: <b>{PROFILE_LANGUAGES.get(profile.get('language'), 'Авто')}</b>\n"
+        f"• Формат: <b>{PROFILE_FORMATS.get(profile.get('output_format'), 'Обычный')}</b>\n"
+        f"• Тема карточек: <b>{PROFILE_THEMES.get(profile.get('theme'), 'Авто')}</b>\n\n"
+        "Выберите параметр, чтобы изменить его."
+    )
+
+
+def _settings_keyboard(profile: dict[str, str]) -> InlineKeyboardMarkup:
+    style_buttons = [
+        InlineKeyboardButton(
+            ("✅ " if profile.get("style") == key else "") + label,
+            callback_data=f"settings:style:{key}"
+        )
+        for key, label in PROFILE_STYLES.items()
+    ]
+    language_buttons = [
+        InlineKeyboardButton(
+            ("✅ " if profile.get("language") == key else "") + label,
+            callback_data=f"settings:language:{key}"
+        )
+        for key, label in PROFILE_LANGUAGES.items()
+    ]
+    format_buttons = [
+        InlineKeyboardButton(
+            ("✅ " if profile.get("output_format") == key else "") + label,
+            callback_data=f"settings:format:{key}"
+        )
+        for key, label in PROFILE_FORMATS.items()
+    ]
+    theme_buttons = [
+        InlineKeyboardButton(
+            ("✅ " if profile.get("theme") == key else "") + label,
+            callback_data=f"settings:theme:{key}"
+        )
+        for key, label in PROFILE_THEMES.items()
+    ]
+
+    def chunk(buttons: list[InlineKeyboardButton], size: int = 3) -> list[list[InlineKeyboardButton]]:
+        return [buttons[i:i + size] for i in range(0, len(buttons), size)]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.extend(chunk(style_buttons, size=2))
+    rows.extend(chunk(language_buttons, size=3))
+    rows.extend(chunk(format_buttons, size=3))
+    rows.extend(chunk(theme_buttons, size=3))
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    profile = await _ensure_profile(user_id)
+    await update.message.reply_text(
+        _settings_text(profile),
+        parse_mode="HTML",
+        reply_markup=_settings_keyboard(profile),
+    )
+
+
+async def on_settings_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    profile = await _ensure_profile(q.from_user.id)
+    try:
+        await q.message.edit_text(
+            _settings_text(profile),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(profile),
+        )
+    except Exception:
+        await q.message.reply_text(
+            _settings_text(profile),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(profile),
+        )
+
+
+async def on_settings_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        _, field, value = q.data.split(":", 2)
+    except ValueError:
+        return
+    user_id = q.from_user.id
+
+    allowed = {
+        "style": set(PROFILE_STYLES.keys()),
+        "language": set(PROFILE_LANGUAGES.keys()),
+        "format": set(PROFILE_FORMATS.keys()),
+        "theme": set(PROFILE_THEMES.keys()),
+    }
+    if field not in allowed or value not in allowed[field]:
+        await q.message.reply_text("Некорректное значение.", reply_markup=main_keyboard())
+        return
+
+    await set_user_profile_value(user_id, field, value)
+    _update_profile_cache(user_id, field, value)
+    profile = await _ensure_profile(user_id)
+    try:
+        await q.message.edit_text(
+            _settings_text(profile),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(profile),
+        )
+    except Exception:
+        await q.message.reply_text(
+            _settings_text(profile),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(profile),
+        )
 # ---------- UI ----------
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1053,8 +1528,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💬 Диалоги", callback_data="dialog")],
         [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img"),
          InlineKeyboardButton("🗂️ Презентация", callback_data="ppt")],
-        [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
-        [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
+        [InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+         InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton("⭐ Шаблоны", callback_data="fav:list"),
+         InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help:how"),
          InlineKeyboardButton("📚 FAQ",    callback_data="help:faq")],
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
@@ -1204,8 +1681,10 @@ async def on_chats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chats:
         rows.append([InlineKeyboardButton("➕ Создать первый чат", callback_data="chat:new")])
     else:
-        for cid, title in chats[:10]:
+        for cid, title, pinned in chats[:10]:
             prefix = "✅ " if active == cid else ""
+            if pinned:
+                prefix = f"{prefix}📌 "
             rows.append([InlineKeyboardButton(f"{prefix}{title}", callback_data=f"chat:open:{cid}")])
         rows.append([InlineKeyboardButton("➕ Новый чат", callback_data="chat:new")])
 
@@ -1237,14 +1716,25 @@ async def on_chat_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # найдём заголовок чата
     chats = await list_chats(user_id)
-    title = next((t for (i, t) in chats if i == cid), f"Чат {cid}")
+    title = next((t for (i, t, _) in chats if i == cid), f"Чат {cid}")
+    pinned = next((p for (i, _, p) in chats if i == cid), False)
 
+    pin_label = "📌 Закрепить" if not pinned else "📍 Открепить"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Переименовать", callback_data=f"chat:rename:{cid}")],
+        [InlineKeyboardButton(pin_label, callback_data=f"chat:pin:{cid}")],
+        [InlineKeyboardButton("🔗 Поделиться ссылкой", callback_data=f"chat:share:{cid}")],
+        [InlineKeyboardButton("📄 Экспорт PDF", callback_data=f"chat:export:pdf:{cid}")],
+        [InlineKeyboardButton("🧾 Markdown для Notion", callback_data=f"chat:export:md:{cid}")],
         [InlineKeyboardButton("🗑️ Удалить",       callback_data=f"chat:delete:{cid}")],
         [InlineKeyboardButton("⬅️ К списку чатов", callback_data="chats")]
     ])
-    await q.message.edit_text(f"Чат: <b>{title}</b>\nВыберите действие:", parse_mode="HTML", reply_markup=kb)
+    status_line = "📌 Закреплён" if pinned else "📎 Не закреплён"
+    await q.message.edit_text(
+        f"Чат: <b>{title}</b>\n{status_line}\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
 
 async def on_chat_rename_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1298,6 +1788,185 @@ async def on_chat_delete_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # иначе вернёмся к списку
     await on_chats_btn(update, context)
+
+
+async def _get_chat_meta(user_id: int, chat_id: int) -> tuple[str, bool]:
+    chats = await list_chats(user_id)
+    for cid, title, pinned in chats:
+        if cid == chat_id:
+            return title, pinned
+    return f"Чат {chat_id}", False
+
+
+async def on_chat_pin_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user_id = q.from_user.id
+    chat_id = int(q.data.split("chat:pin:", 1)[-1])
+    title, pinned = await _get_chat_meta(user_id, chat_id)
+    await set_chat_pinned(user_id, chat_id, not pinned)
+    try:
+        await q.answer(f"Чат «{title}» {'закреплён' if not pinned else 'откреплён'}.", show_alert=False)
+    except Exception:
+        pass
+    await on_chat_open(update, context)
+
+
+def _chat_history_to_markdown(title: str, history: list[tuple[str, str, str]]) -> str:
+    lines = [f"# {title}", ""]
+    for role, content, created_at in history:
+        label = "Пользователь" if role == "user" else "Ассистент" if role == "assistant" else "Система"
+        timestamp = created_at.replace("T", " ").split("+", 1)[0]
+        lines.append(f"## {label} · {timestamp}")
+        lines.append(content.strip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _chat_history_to_html(title: str, history: list[tuple[str, str, str]]) -> str:
+    body = [f"<h1>{html.escape(title)}</h1>"]
+    for role, content, created_at in history:
+        label = "Пользователь" if role == "user" else "Ассистент" if role == "assistant" else "Система"
+        timestamp = created_at.replace("T", " ").split("+", 1)[0]
+        body.append("<div class='entry'>")
+        body.append(f"<div class='meta'>{html.escape(label)} · {html.escape(timestamp)}</div>")
+        safe = html.escape(content).replace("\n", "<br>")
+        body.append(f"<div class='content'>{safe}</div>")
+        body.append("</div>")
+    return "\n".join(body)
+
+
+def _find_font_path() -> str | None:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        str(Path.home() / "Library/Fonts/Arial Unicode.ttf"),
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+
+def _build_pdf_from_history(title: str, history: list[tuple[str, str, str]], dest: Path):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    font_path = _find_font_path()
+    if font_path:
+        pdf.add_font("Custom", "", font_path, uni=True)
+        font_name = "Custom"
+    else:
+        font_name = "Arial"
+    pdf.add_page()
+    pdf.set_font(font_name, size=18)
+    pdf.multi_cell(0, 10, title)
+    pdf.ln(4)
+    for role, content, created_at in history:
+        label = "Пользователь" if role == "user" else "Ассистент" if role == "assistant" else "Система"
+        timestamp = created_at.replace("T", " ").split("+", 1)[0]
+        pdf.set_font(font_name, size=12)
+        header = f"{label} · {timestamp}"
+        if not font_path:
+            header = header.encode("latin-1", "replace").decode("latin-1")
+        pdf.multi_cell(0, 7, header)
+        pdf.set_font(font_name, size=11)
+        text = content.strip()
+        if not font_path:
+            text = text.encode("latin-1", "replace").decode("latin-1")
+        pdf.multi_cell(0, 6, text)
+        pdf.ln(4)
+    pdf.output(str(dest))
+
+
+async def on_chat_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    chat_id = int(q.data.split("chat:share:", 1)[-1])
+    if not _public_url:
+        await q.message.reply_text("Общая ссылка недоступна: не задан PUBLIC_URL.", reply_markup=main_keyboard())
+        return
+    title, _ = await _get_chat_meta(user_id, chat_id)
+    await cleanup_chat_shares()
+    token, expires_iso = await create_chat_share(user_id, chat_id)
+    link = f"{_public_url.rstrip('/')}/share/{token}"
+    expires_dt = datetime.fromisoformat(expires_iso)
+    expires_text = expires_dt.strftime("%d.%m.%Y %H:%M")
+    await q.message.reply_text(
+        f"🔗 Ссылка на чат «{title}»:\n{link}\n\n"
+        f"Действует до {expires_text} (UTC). Передайте ссылку, чтобы коллеги могли просмотреть диалог.",
+        disable_web_page_preview=True,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def on_chat_export_md(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    chat_id = int(q.data.split("chat:export:md:", 1)[-1])
+    title, _ = await _get_chat_meta(user_id, chat_id)
+    history = await get_chat_history_all(chat_id)
+    if not history:
+        await q.message.reply_text("Чат пуст — нечего экспортировать.", reply_markup=main_keyboard())
+        return
+    markdown = _chat_history_to_markdown(title, history)
+    tmpdir = Path(tempfile.gettempdir())
+    fname = re.sub(r"[^A-Za-z0-9]+", "_", title)[:40] or f"chat_{chat_id}"
+    path = tmpdir / f"{fname}.md"
+    path.write_text(markdown, encoding="utf-8")
+    try:
+        with open(path, "rb") as fh:
+            await q.message.reply_document(
+                document=fh,
+                filename=path.name,
+                caption="Экспортирован в Markdown. Импортируйте файл в Notion или откройте в редакторе.",
+            )
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def on_chat_export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    user_id = q.from_user.id
+    chat_id = int(q.data.split("chat:export:pdf:", 1)[-1])
+    title, _ = await _get_chat_meta(user_id, chat_id)
+    history = await get_chat_history_all(chat_id)
+    if not history:
+        await q.message.reply_text("Чат пуст — нечего экспортировать.", reply_markup=main_keyboard())
+        return
+    tmpdir = Path(tempfile.gettempdir())
+    fname = re.sub(r"[^A-Za-z0-9]+", "_", title)[:40] or f"chat_{chat_id}"
+    path = tmpdir / f"{fname}.pdf"
+    try:
+        _build_pdf_from_history(title, history, path)
+        with open(path, "rb") as fh:
+            await q.message.reply_document(
+                document=fh,
+                filename=path.name,
+                caption="PDF-файл готов — можно делиться с командой или печатать.",
+            )
+    except Exception as e:
+        await q.message.reply_text(f"Не удалось собрать PDF: {e}", reply_markup=main_keyboard())
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 # =========================
 # Кнопка/команда генерации изображений
@@ -1396,17 +2065,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_keyboard())
+        try:
+            await update.message.reply_text("Быстрые команды доступны на клавиатуре ниже.", reply_markup=QUICK_COMMANDS_KEYBOARD)
+        except Exception:
+            pass
     else:
         await context.bot.send_message(chat_id=user.id, text=text, parse_mode="HTML", reply_markup=main_keyboard())
+        try:
+            await context.bot.send_message(chat_id=user.id, text="Быстрые команды доступны на клавиатуре ниже.", reply_markup=QUICK_COMMANDS_KEYBOARD)
+        except Exception:
+            pass
 
 
 # =========================
 # Профиль
 # =========================
 async def _render_profile_html(user_id: int) -> str:
+    profile = await _ensure_profile(user_id)
     prem = await is_premium(user_id)
     used_today = await get_usage_today(user_id)
     bonus = await get_free_credits(user_id)
+    fav_count = len(await list_favorite_prompts(user_id))
 
     me = await application.bot.get_me()
     deep_link = f"https://t.me/{me.username}?start=ref_{user_id}"
@@ -1445,6 +2124,12 @@ async def _render_profile_html(user_id: int) -> str:
         f"Осталось заявок: <b>{left_text}</b>\n"
         f"Модель: <b>{visual}</b>\n"
         f"Режим: <b>{mode_lbl}</b>\n\n"
+        "🧾 <b>Настройки</b>\n"
+        f"• Стиль: <b>{PROFILE_STYLES.get(profile.get('style'), 'Стандарт')}</b>\n"
+        f"• Язык: <b>{PROFILE_LANGUAGES.get(profile.get('language'), 'Авто')}</b>\n"
+        f"• Формат: <b>{PROFILE_FORMATS.get(profile.get('output_format'), 'Обычный')}</b>\n"
+        f"• Тема: <b>{PROFILE_THEMES.get(profile.get('theme'), 'Авто')}</b>\n"
+        f"• Избранных шаблонов: <b>{fav_count}</b>\n\n"
         f"🔗 <b>Ваша реферальная ссылка:</b>\n{deep_link}\n\n"
         f"За каждого приглашённого: +{REF_BONUS} заявок."
     )
@@ -1944,6 +2629,8 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Сообщение пустое. Пожалуйста, отправьте текст.")
         return
 
+    await _ensure_profile(user_id)
+
     # Переименование чата — если ждём от пользователя новое имя
     if _pending_chat_rename.get(user_id):
         cid = _pending_chat_rename[user_id]
@@ -1975,6 +2662,8 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Генерирую изображение…")
         await generate_image_and_send(user_id, update.effective_chat.id, text, context.bot)
         return
+
+    _last_user_prompt[user_id] = text
 
     # лимиты как раньше
     if not await is_premium(user_id):
@@ -2028,22 +2717,23 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
     # ➌ Отправляем ответ (кнопки как обсуждали)
     _last_answer[user_id] = reply
     parts = _split_for_telegram(reply)
+    buttons: list[list[InlineKeyboardButton]] = []
     if len(parts) == 1:
         _last_answer[user_id] = parts[0]
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
-        await update.message.reply_text(parts[0], reply_markup=kb)
+        buttons.append([InlineKeyboardButton("🎧 Озвучить", callback_data="tts")])
     else:
         _long_reply_queue[user_id] = parts[1:]
         _last_answer[user_id] = parts[0]
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
-                    InlineKeyboardButton("🎧 Озвучить", callback_data="tts"),
-                ]
-            ]
-        )
-        await update.message.reply_text(parts[0], reply_markup=kb)
+        buttons.append([
+            InlineKeyboardButton("Показать ещё ▶️", callback_data="more"),
+            InlineKeyboardButton("🎧 Озвучить", callback_data="tts"),
+        ])
+    buttons.append([
+        InlineKeyboardButton("⭐ Шаблон", callback_data="fav:add"),
+        InlineKeyboardButton("🔁 Перевести", callback_data="quick:translate"),
+        InlineKeyboardButton("🧾 Сжать", callback_data="quick:summary"),
+    ])
+    await update.message.reply_text(parts[0], reply_markup=InlineKeyboardMarkup(buttons))
     return
 
 
@@ -2409,6 +3099,39 @@ async def cryptopay_webhook(request: Request):
 
     return {"ok": True}
 
+@app.get("/share/{token}")
+async def share_chat(token: str):
+    data = await get_chat_share(token)
+    if not data:
+        return PlainTextResponse("Link expired or invalid.", status_code=404)
+    user_id, chat_id = data
+    history = await get_chat_history_all(chat_id)
+    title, _ = await _get_chat_meta(user_id, chat_id)
+    body = _chat_history_to_html(title, history) if history else "<p>Чат пуст.</p>"
+    html_page = f"""
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>{html.escape(title)} · NeuroBot</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#f4f5fb; color:#1f2333; margin:0; padding:40px; }}
+            .card {{ max-width: 920px; margin:0 auto; background:white; border-radius:18px; padding:32px; box-shadow:0 14px 35px rgba(31,35,51,0.08); }}
+            h1 {{ margin-top:0; font-size:32px; }}
+            .entry {{ border-top:1px solid #E5E8F0; padding:18px 0; }}
+            .entry:first-of-type {{ border-top:none; }}
+            .meta {{ font-size:13px; color:#63708f; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.04em; }}
+            .content {{ font-size:16px; line-height:1.6; white-space:pre-wrap; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            {body}
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html_page)
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
@@ -2474,6 +3197,10 @@ async def _premium_expiry_notifier_loop():
                     await mark_expired_notified(uid, now_iso)
                 except Exception:
                     pass
+            try:
+                await cleanup_chat_shares(now_iso)
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("premium notifier error: %s", e)
         await asyncio.sleep(900)  # 15 минут
@@ -2501,7 +3228,9 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("buy",    cmd_buy))
     app_.add_handler(CommandHandler("models", cmd_models))
     app_.add_handler(CommandHandler("mode",   cmd_mode))
+    app_.add_handler(CommandHandler("settings", cmd_settings))
     app_.add_handler(CommandHandler("help",   cmd_help))
+    app_.add_handler(CommandHandler("favorites", cmd_favorites))
     app_.add_handler(CommandHandler("ppt",    cmd_ppt))
     app_.add_handler(CommandHandler("support", cmd_support))
     app_.add_handler(CommandHandler("faq",     cmd_faq))
@@ -2511,10 +3240,18 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("img", cmd_img))
     app_.add_handler(CallbackQueryHandler(on_tts_btn, pattern=r"^tts$"))
     app_.add_handler(CallbackQueryHandler(on_more_btn, pattern=r"^more$"))
+    app_.add_handler(CallbackQueryHandler(on_quick_translate, pattern=r"^quick:translate$"))
+    app_.add_handler(CallbackQueryHandler(on_quick_summary, pattern=r"^quick:summary$"))
+    app_.add_handler(CallbackQueryHandler(on_fav_add, pattern=r"^fav:add$"))
+    app_.add_handler(CallbackQueryHandler(on_favorites_btn, pattern=r"^fav:list$"))
+    app_.add_handler(CallbackQueryHandler(on_fav_run, pattern=r"^fav:run:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_fav_delete, pattern=r"^fav:del:\d+$"))
 
     # кнопки
     app_.add_handler(CallbackQueryHandler(on_buy_btn,      pattern=r"^buy$"))
     app_.add_handler(CallbackQueryHandler(on_profile_btn,  pattern=r"^profile$"))
+    app_.add_handler(CallbackQueryHandler(on_settings_btn, pattern=r"^settings$"))
+    app_.add_handler(CallbackQueryHandler(on_settings_change, pattern=r"^settings:(style|language|format|theme):.+$"))
     app_.add_handler(CallbackQueryHandler(on_ref_btn,      pattern=r"^ref$"))
     app_.add_handler(CallbackQueryHandler(on_models_btn,   pattern=r"^models$"))
     app_.add_handler(CallbackQueryHandler(on_models_view_toggle, pattern=r"^mvis:(short|full)$"))
@@ -2549,6 +3286,10 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_chat_rename_ask,   pattern=r"^chat:rename:\d+$"))
     app_.add_handler(CallbackQueryHandler(on_chat_delete_confirm, pattern=r"^chat:delete:\d+$"))
     app_.add_handler(CallbackQueryHandler(on_chat_delete_do,    pattern=r"^chat:delete:do:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_pin_toggle,   pattern=r"^chat:pin:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_share,        pattern=r"^chat:share:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_export_pdf,   pattern=r"^chat:export:pdf:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_chat_export_md,    pattern=r"^chat:export:md:\d+$"))
 
     # error-handler
     app_.add_error_handler(on_error)

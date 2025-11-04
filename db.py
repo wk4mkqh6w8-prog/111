@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, timezone, date
+import uuid
+from datetime import datetime, timezone, date, timedelta
 
 import aiosqlite
 
@@ -21,6 +22,16 @@ def _utcnow_iso() -> str:
 def _today_str() -> str:
     # Локальная календарная дата YYYY-MM-DD (для дневного лимита)
     return date.today().isoformat()
+
+
+async def _ensure_column(db: aiosqlite.Connection, table: str, column: str, ddl: str):
+    """Добавляет колонку, если её ещё нет."""
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    columns = await cur.fetchall()
+    await cur.close()
+    if any(row[1] == column for row in columns):
+        return
+    await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 # ========= ИНИЦИАЛИЗАЦИЯ =========
@@ -74,11 +85,16 @@ async def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_premium_events_day
               ON premium_events(activated_at);
-              -- Режим диалога и активный чат
+
+            -- Режим диалога и пользовательские настройки
             CREATE TABLE IF NOT EXISTS user_prefs (
                 user_id         INTEGER PRIMARY KEY,
                 chat_mode       TEXT NOT NULL DEFAULT 'simple', -- 'simple' | 'rooms'
-                active_chat_id  INTEGER
+                active_chat_id  INTEGER,
+                style           TEXT NOT NULL DEFAULT 'standard',
+                language        TEXT NOT NULL DEFAULT 'auto',
+                output_format   TEXT NOT NULL DEFAULT 'plain',
+                theme           TEXT NOT NULL DEFAULT 'auto'
             );
 
             -- Список чатов пользователя
@@ -86,7 +102,8 @@ async def init_db():
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL,
                 title       TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                is_pinned   INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_id);
 
@@ -99,8 +116,36 @@ async def init_db():
                 created_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id);
+
+            -- Любимые подсказки / шаблоны пользователя
+            CREATE TABLE IF NOT EXISTS favorite_prompts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                title      TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fav_prompts_user ON favorite_prompts(user_id);
+
+            -- Шаринг чатов
+            CREATE TABLE IF NOT EXISTS chat_shares (
+                token       TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                chat_id     INTEGER NOT NULL,
+                created_at  TEXT NOT NULL,
+                expires_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_shares_exp ON chat_shares(expires_at);
             """
         )
+
+        # Гарантируем наличие новых колонок для уже существующих таблиц
+        await _ensure_column(db, "user_prefs", "style", "TEXT NOT NULL DEFAULT 'standard'")
+        await _ensure_column(db, "user_prefs", "language", "TEXT NOT NULL DEFAULT 'auto'")
+        await _ensure_column(db, "user_prefs", "output_format", "TEXT NOT NULL DEFAULT 'plain'")
+        await _ensure_column(db, "user_prefs", "theme", "TEXT NOT NULL DEFAULT 'auto'")
+        await _ensure_column(db, "chats", "is_pinned", "INTEGER NOT NULL DEFAULT 0")
+
         await db.commit()
 
 
@@ -403,7 +448,7 @@ async def set_chat_mode(user_id: int, mode: str):
 async def create_chat(user_id: int, title: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO chats(user_id, title, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO chats(user_id, title, created_at, is_pinned) VALUES (?, ?, ?, 0)",
             (user_id, title.strip() or "Новый чат", _utcnow_iso()),
         )
         chat_id = (await db.execute("SELECT last_insert_rowid()")).fetchone
@@ -414,15 +459,16 @@ async def create_chat(user_id: int, title: str) -> int:
         await db.commit()
         return new_id
 
-async def list_chats(user_id: int) -> list[tuple[int, str]]:
+async def list_chats(user_id: int) -> list[tuple[int, str, bool]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, title FROM chats WHERE user_id = ? ORDER BY id DESC",
+            "SELECT id, title, is_pinned FROM chats WHERE user_id = ? "
+            "ORDER BY is_pinned DESC, id DESC",
             (user_id,),
         )
         rows = await cur.fetchall()
         await cur.close()
-        return [(int(r[0]), r[1]) for r in rows]
+        return [(int(r[0]), r[1], bool(r[2])) for r in rows]
 
 async def set_active_chat(user_id: int, chat_id: int | None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -485,7 +531,173 @@ async def delete_chat(user_id: int, chat_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         # Сначала удалим историю
         await db.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM chat_shares WHERE chat_id = ?", (chat_id,))
         # Потом сам чат (с проверкой владельца)
         cur = await db.execute("DELETE FROM chats WHERE id = ? AND user_id = ?", (chat_id, user_id))
         await db.commit()
         return cur.rowcount > 0
+
+# ========= ПРОФИЛИ ПОЛЬЗОВАТЕЛЕЙ =========
+
+DEFAULT_PROFILE = {
+    "style": "standard",
+    "language": "auto",
+    "output_format": "plain",
+    "theme": "auto",
+}
+
+
+async def get_user_profile_settings(user_id: int) -> dict[str, str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT style, language, output_format, theme
+            FROM user_prefs
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            await db.execute(
+                """
+                INSERT INTO user_prefs(user_id, chat_mode, active_chat_id, style, language, output_format, theme)
+                VALUES (?, 'simple', NULL, ?, ?, ?, ?)
+                """,
+                (user_id, DEFAULT_PROFILE["style"], DEFAULT_PROFILE["language"],
+                 DEFAULT_PROFILE["output_format"], DEFAULT_PROFILE["theme"]),
+            )
+            await db.commit()
+            return dict(DEFAULT_PROFILE)
+        return {
+            "style": row[0] or DEFAULT_PROFILE["style"],
+            "language": row[1] or DEFAULT_PROFILE["language"],
+            "output_format": row[2] or DEFAULT_PROFILE["output_format"],
+            "theme": row[3] or DEFAULT_PROFILE["theme"],
+        }
+
+
+async def set_user_profile_value(user_id: int, field: str, value: str):
+    if field not in {"style", "language", "output_format", "theme"}:
+        raise ValueError(f"Unknown profile field {field}")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"""
+            INSERT INTO user_prefs(user_id, chat_mode, active_chat_id, {field})
+            VALUES (?, 'simple', NULL, ?)
+            ON CONFLICT(user_id) DO UPDATE SET {field} = excluded.{field}
+            """,
+            (user_id, value),
+        )
+        await db.commit()
+
+
+# ========= ЛЮБИМЫЕ ПОДСКАЗКИ =========
+
+async def add_favorite_prompt(user_id: int, title: str, content: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO favorite_prompts(user_id, title, content, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, title.strip()[:80] or "Без названия", content, _utcnow_iso()),
+        )
+        cur = await db.execute("SELECT last_insert_rowid()")
+        row = await cur.fetchone()
+        await cur.close()
+        await db.commit()
+        return int(row[0])
+
+
+async def list_favorite_prompts(user_id: int) -> list[tuple[int, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, title FROM favorite_prompts WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1]) for r in rows]
+
+
+async def get_favorite_prompt(user_id: int, fav_id: int) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT title, content FROM favorite_prompts WHERE user_id = ? AND id = ?",
+            (user_id, fav_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return row[0], row[1]
+
+
+async def delete_favorite_prompt(user_id: int, fav_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM favorite_prompts WHERE user_id = ? AND id = ?",
+            (user_id, fav_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# ========= ПИНЫ И ШАРИНГ ЧАТОВ =========
+
+async def set_chat_pinned(user_id: int, chat_id: int, pinned: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE chats SET is_pinned = ? WHERE id = ? AND user_id = ?",
+            (1 if pinned else 0, chat_id, user_id),
+        )
+        await db.commit()
+
+
+async def create_chat_share(user_id: int, chat_id: int, hours_valid: int = 168) -> tuple[str, str]:
+    token = uuid.uuid4().hex
+    created = _utcnow_iso()
+    expires = (datetime.fromisoformat(created) + timedelta(hours=hours_valid)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chat_shares(token, user_id, chat_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (token, user_id, chat_id, created, expires),
+        )
+        await db.commit()
+    return token, expires
+
+
+async def get_chat_share(token: str) -> tuple[int, int] | None:
+    now = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id, chat_id FROM chat_shares WHERE token = ? AND expires_at > ?",
+            (token, now),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return int(row[0]), int(row[1])
+
+
+async def cleanup_chat_shares(now_iso: str | None = None):
+    now_iso = now_iso or _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM chat_shares WHERE expires_at <= ?", (now_iso,))
+        await db.commit()
+
+
+async def get_chat_history_all(chat_id: int) -> list[tuple[str, str, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT role, content, created_at
+            FROM chat_messages
+            WHERE chat_id = ?
+            ORDER BY id ASC
+            """,
+            (chat_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(r[0], r[1], r[2]) for r in rows]
