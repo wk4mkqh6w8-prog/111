@@ -17,8 +17,10 @@ from pathlib import Path
 from pypdf import PdfReader  # pip install PyPDF2
 from gtts import gTTS  # ← добавь импорт рядом с остальными
 from pptx import Presentation
-from pptx.util import Pt
+from pptx.util import Pt, Inches
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 
 import httpx
 import requests
@@ -528,6 +530,14 @@ def _parse_slides_from_text(raw: str, topic: str) -> list[dict[str, list[str]]]:
     return slides[:8]
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+DEFAULT_PALETTE = {
+    "background": "#F5F7FB",
+    "accent": "#3F51F9",
+    "accent_light": "#E8ECFF",
+    "text": "#1F2333",
+    "subtitle": "#4D5A7C",
+}
 
 
 def _extract_json_array(raw: str) -> list | None:
@@ -598,6 +608,104 @@ def _normalize_slide(item: dict, idx: int, topic: str) -> dict[str, list[str]]:
     return {"title": title, "bullets": bullets[:5]}
 
 
+def _extract_json_object(raw: str) -> dict | None:
+    """Парсим один JSON-объект из текста."""
+    if not raw:
+        return None
+
+    def _try(candidate: str):
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    direct = _try(raw)
+    if direct:
+        return direct
+
+    for match in _JSON_BLOCK_RE.finditer(raw):
+        parsed = _try(match.group(1))
+        if parsed:
+            return parsed
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        parsed = _try(raw[start:end + 1])
+        if parsed:
+            return parsed
+
+    return None
+
+
+def _hex_to_rgb_tuple(value: str | None) -> tuple[int, int, int] | None:
+    if not value:
+        return None
+    match = _HEX_RE.match(value.strip())
+    if not match:
+        return None
+    hex_part = match.group(1)
+    return tuple(int(hex_part[i:i + 2], 16) for i in range(0, 6, 2))  # type: ignore[return-value]
+
+
+def _lighten_color(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    factor = max(0.0, min(factor, 1.0))
+    return tuple(int(c + (255 - c) * factor) for c in rgb)
+
+
+def _choose_color_palette(user_id: int, topic: str) -> dict[str, tuple[int, int, int]]:
+    prompt = (
+        "Подбери гармоничную цветовую палитру для презентации по теме ниже. "
+        "Верни JSON-объект без пояснений, формата:\n"
+        "{\"background\": \"#RRGGBB\", \"accent\": \"#RRGGBB\", "
+        "\"accent_light\": \"#RRGGBB\", \"text\": \"#RRGGBB\", \"subtitle\": \"#RRGGBB\"}\n\n"
+        f"Тема: {topic}"
+    )
+    raw = ask_llm(user_id, prompt)
+    data = _extract_json_object(raw) or {}
+
+    palette: dict[str, tuple[int, int, int]] = {}
+    for key, fallback in DEFAULT_PALETTE.items():
+        rgb = _hex_to_rgb_tuple(str(data.get(key, fallback)))
+        if rgb is None:
+            rgb = _hex_to_rgb_tuple(fallback)
+        palette[key] = rgb or (255, 255, 255)
+
+    if not data.get("accent_light"):
+        palette["accent_light"] = _lighten_color(palette["accent"], 0.7)
+    return palette
+
+
+def _pick_slide_emoji(title: str) -> str:
+    title_lower = (title or "").lower()
+    mapping = [
+        ("маркет", "📈"),
+        ("продаж", "💼"),
+        ("финанс", "💰"),
+        ("технолог", "🤖"),
+        ("образован", "🎓"),
+        ("команда", "🤝"),
+        ("анализ", "📊"),
+        ("стратег", "🧭"),
+        ("дизайн", "🎨"),
+        ("риск", "⚠️"),
+        ("план", "🗺️"),
+        ("экология", "🌱"),
+        ("здоров", "🩺"),
+        ("продукт", "🧪"),
+    ]
+    for key, emoji in mapping:
+        if key in title_lower:
+            return emoji
+    return "✨"
+
+
 def _generate_presentation_structure(user_id: int, topic: str) -> list[dict[str, list[str]]]:
     prompt = (
         "Составь краткую структуру презентации по указанной теме. "
@@ -627,61 +735,157 @@ def _generate_presentation_structure(user_id: int, topic: str) -> list[dict[str,
 
     return slides_data[:8]
 
-def _build_presentation_file(slides: list[dict[str, list[str]]], path: Path, topic: str):
+
+async def _generate_presentation_image(topic: str) -> Path | None:
+    if not REPLICATE_KEY:
+        return None
+    prompt = (
+        f"High-quality 16:9 illustration for a presentation cover about {topic}. "
+        "Modern flat design, soft gradients, no text, professional colour palette."
+    )
+    try:
+        urls = await asyncio.to_thread(_replicate_generate_sync, prompt, width=1280, height=720)
+    except Exception:
+        return None
+    if not urls:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(urls[0])
+            resp.raise_for_status()
+            tmpdir = Path(tempfile.gettempdir())
+            fpath = tmpdir / f"ppt_cover_{int(time.time())}.png"
+            fpath.write_bytes(resp.content)
+            return fpath
+    except Exception:
+        return None
+
+
+def _set_slide_background(slide, rgb: tuple[int, int, int]):
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = RGBColor(*rgb)
+
+
+def _build_presentation_file(
+    slides: list[dict[str, list[str]]],
+    path: Path,
+    topic: str,
+    palette: dict[str, tuple[int, int, int]],
+    hero_image: Path | None,
+):
     prs = Presentation()
+    slide_width = prs.slide_width
+    slide_height = prs.slide_height
+
+    bg_rgb = palette["background"]
+    accent_rgb = palette["accent"]
+    accent_light_rgb = palette["accent_light"]
+    text_rgb = palette["text"]
+    subtitle_rgb = palette["subtitle"]
 
     title_layout = prs.slide_layouts[0]
-    title_slide = prs.slides.add_slide(title_layout)
-    if title_slide.shapes.title:
-        title_tf = title_slide.shapes.title.text_frame
+    title_slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_slide_background(title_slide, bg_rgb)
+
+    top_band = title_slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, slide_width, Inches(0.45))
+    top_band.fill.solid()
+    top_band.fill.fore_color.rgb = RGBColor(*accent_rgb)
+    top_band.line.fill.background()
+
+    if hero_image and hero_image.exists():
+        try:
+            img_width = Inches(4.8)
+            img_left = slide_width - img_width - Inches(0.6)
+            img_top = Inches(1.1)
+            title_slide.shapes.add_picture(str(hero_image), img_left, img_top, width=img_width)
+        except Exception:
+            pass
+
+    title_box_width = slide_width - Inches(1.5)
+    if hero_image and hero_image.exists():
+        title_box_width = slide_width - Inches(6.0)
+    title_box = title_slide.shapes.add_textbox(Inches(0.8), Inches(1.0), title_box_width, Inches(2.5))
+    title_tf = title_box.text_frame
+    title_tf.clear()
+    title_tf.word_wrap = True
+    title_para = title_tf.paragraphs[0]
+    title_para.text = topic
+    title_para.font.size = Pt(56)
+    title_para.font.bold = True
+    title_para.font.color.rgb = RGBColor(*text_rgb)
+
+    subtitle_box = title_slide.shapes.add_textbox(Inches(0.8), Inches(3.1), title_box_width, Inches(1))
+    subtitle_tf = subtitle_box.text_frame
+    subtitle_tf.clear()
+    subtitle_para = subtitle_tf.paragraphs[0]
+    subtitle_para.text = "Сгенерировано NeuroBot 🤖"
+    subtitle_para.font.size = Pt(22)
+    subtitle_para.font.color.rgb = RGBColor(*subtitle_rgb)
+
+    for idx, slide_data in enumerate(slides, start=1):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        _set_slide_background(slide, bg_rgb)
+
+        side_band = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.35), slide_height)
+        side_band.fill.solid()
+        side_band.fill.fore_color.rgb = RGBColor(*accent_rgb)
+        side_band.line.fill.background()
+
+        title_box = slide.shapes.add_textbox(Inches(0.8), Inches(0.75), slide_width - Inches(1.6), Inches(1.1))
+        title_tf = title_box.text_frame
         title_tf.clear()
         title_para = title_tf.paragraphs[0]
-        title_para.text = topic
-        if title_para.font:
-            title_para.font.size = Pt(48)
-            title_para.font.bold = True
-    try:
-        subtitle = title_slide.placeholders[1]
-        subtitle_tf = subtitle.text_frame
-        subtitle_tf.clear()
-        para = subtitle_tf.paragraphs[0]
-        para.text = "Сгенерировано NeuroBot 🤖"
-        if para.font:
-            para.font.size = Pt(20)
-            para.font.color.rgb = RGBColor(120, 120, 120)
-    except Exception:
-        pass
+        title_para.text = slide_data.get("title") or f"Слайд {idx}"
+        title_para.font.size = Pt(38)
+        title_para.font.bold = True
+        title_para.font.color.rgb = RGBColor(*accent_rgb)
 
-    content_layout = prs.slide_layouts[1]
-    for idx, slide_data in enumerate(slides, start=1):
-        slide = prs.slides.add_slide(content_layout)
-        if slide.shapes.title:
-            title_tf = slide.shapes.title.text_frame
-            title_tf.clear()
-            title_para = title_tf.paragraphs[0]
-            title_para.text = slide_data.get("title") or f"Слайд {idx}"
-            if title_para.font:
-                title_para.font.size = Pt(36)
-                title_para.font.bold = True
-        try:
-            text_frame = slide.shapes.placeholders[1].text_frame
-        except Exception:
-            continue
+        emoji_shape = slide.shapes.add_shape(MSO_SHAPE.OVAL, slide_width - Inches(1.8), Inches(0.55), Inches(1.05), Inches(1.05))
+        emoji_shape.fill.solid()
+        emoji_shape.fill.fore_color.rgb = RGBColor(*accent_rgb)
+        emoji_shape.line.fill.background()
+        emoji_tf = emoji_shape.text_frame
+        emoji_tf.clear()
+        emoji_tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        emoji_para = emoji_tf.paragraphs[0]
+        emoji_para.text = _pick_slide_emoji(slide_data.get("title") or "")
+        emoji_para.alignment = PP_ALIGN.CENTER
+        emoji_para.font.size = Pt(34)
+        emoji_para.font.bold = True
+        emoji_para.font.color.rgb = RGBColor(*bg_rgb)
+
+        content_shape = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(0.8),
+            Inches(1.8),
+            slide_width - Inches(1.6),
+            slide_height - Inches(2.6),
+        )
+        content_shape.fill.solid()
+        content_shape.fill.fore_color.rgb = RGBColor(*accent_light_rgb)
+        content_shape.line.width = Pt(1.8)
+        content_shape.line.color.rgb = RGBColor(*accent_rgb)
+
+        text_frame = content_shape.text_frame
         text_frame.clear()
         text_frame.word_wrap = True
-        text_frame.margin_left = Pt(10)
-        text_frame.margin_right = Pt(10)
-        text_frame.margin_top = Pt(5)
-        text_frame.margin_bottom = Pt(5)
+        text_frame.margin_left = Pt(20)
+        text_frame.margin_right = Pt(20)
+        text_frame.margin_top = Pt(18)
+        text_frame.margin_bottom = Pt(18)
+        text_frame.vertical_anchor = MSO_ANCHOR.TOP
+
         bullets = slide_data.get("bullets") or []
         for bullet_idx, bullet in enumerate(bullets):
-            paragraph = text_frame.paragraphs[0] if bullet_idx == 0 else text_frame.add_paragraph()
-            paragraph.text = bullet
-            paragraph.level = 0
-            if paragraph.font:
-                size = 26 if len(bullets) <= 4 else 22
-                paragraph.font.size = Pt(size)
-                paragraph.font.bold = False
+            para = text_frame.paragraphs[0] if bullet_idx == 0 else text_frame.add_paragraph()
+            para.text = bullet
+            para.level = 0
+            para.font.size = Pt(26 if len(bullets) <= 4 else 22)
+            para.font.color.rgb = RGBColor(*text_rgb)
+            para.line_spacing = 1.2
+            para.space_after = Pt(8)
 
     prs.save(str(path))
 
@@ -1648,6 +1852,7 @@ async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text("🧩 Составляю структуру презентации…")
     ppt_path: Path | None = None
+    hero_image: Path | None = None
     try:
         slides = _generate_presentation_structure(user_id, topic)
         if not slides:
@@ -1655,7 +1860,9 @@ async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tmpdir = Path(tempfile.gettempdir())
         ppt_path = tmpdir / f"presentation_{user_id}_{int(time.time())}.pptx"
-        _build_presentation_file(slides, ppt_path, topic)
+        palette = _choose_color_palette(user_id, topic)
+        hero_image = await _generate_presentation_image(topic)
+        _build_presentation_file(slides, ppt_path, topic, palette, hero_image)
 
         try:
             await status.edit_text("📤 Отправляю файл…")
@@ -1683,6 +1890,11 @@ async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ppt_path:
             try:
                 ppt_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if hero_image:
+            try:
+                hero_image.unlink(missing_ok=True)
             except Exception:
                 pass
 
