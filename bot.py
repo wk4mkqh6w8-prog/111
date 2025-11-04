@@ -7,6 +7,7 @@ import hashlib
 import subprocess
 import threading
 import time
+import re
 from datetime import datetime, timedelta
 
 import base64
@@ -15,6 +16,8 @@ import tempfile
 from pathlib import Path
 from pypdf import PdfReader  # pip install PyPDF2
 from gtts import gTTS  # ← добавь импорт рядом с остальными
+from pptx import Presentation
+from pptx.util import Pt
 
 import httpx
 import requests
@@ -316,6 +319,45 @@ def ask_llm_context(user_id: int, history: list[tuple[str, str]], user_text: str
         # Используем общий вызов с переключением ключей
         return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.7)
 
+def _transcribe_audio_file_sync(path: Path) -> str:
+    """
+    Выполняет синхронную расшифровку аудио через OpenAI (используем пул ключей).
+    Возвращает распознанный текст.
+    """
+    last_err: Exception | None = None
+    tried: set[str] = set()
+
+    for _ in range(len(OPENAI_KEYS)):
+        api_key = _pick_next_key()
+        if not api_key or api_key in tried:
+            break
+        tried.add(api_key)
+        client = _get_client(api_key)
+        try:
+            with path.open("rb") as audio_file:
+                result = client.audio.transcriptions.create(
+                    model="gpt-4o-transcribe",
+                    file=audio_file,
+                    response_format="text",
+                )
+            if isinstance(result, str):
+                return result.strip()
+            text = getattr(result, "text", "")
+            if text:
+                return str(text).strip()
+            return ""
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status == 401:
+                _mark_cooldown(api_key, 600)
+            elif status in (429, 500, 503):
+                _mark_cooldown(api_key, 60)
+            else:
+                _mark_cooldown(api_key, 10)
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Transcription failed: {last_err!s}")
 
 async def tts_and_send(user_id: int, chat_id: int, text: str, bot):
     """Озвучивает text через gTTS и пытается отправить голосовое (OPUS)."""
@@ -450,6 +492,103 @@ def _analyze_image_with_llm(user_id: int, hint: str, image_b64: str) -> str:
     ]
     return _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.4)
 
+def _parse_slides_from_text(raw: str, topic: str) -> list[dict[str, list[str]]]:
+    slides: list[dict[str, list[str]]] = []
+    current_title: str | None = None
+    current_bullets: list[str] = []
+
+    for line in (raw or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith(("slide", "слайд", "#")) and ":" in stripped:
+            if current_title or current_bullets:
+                slides.append({
+                    "title": current_title or topic,
+                    "bullets": current_bullets or ["(нет заметок)"],
+                })
+            current_title = stripped.split(":", 1)[1].strip() or topic
+            current_bullets = []
+        else:
+            bullet = stripped.lstrip("•*-—– ").strip()
+            if bullet:
+                current_bullets.append(bullet[:200])
+
+    if current_title or current_bullets:
+        slides.append({
+            "title": current_title or topic,
+            "bullets": current_bullets or ["(нет заметок)"],
+        })
+
+    if not slides:
+        summary = (raw or "").strip() or "Нет данных"
+        slides = [{"title": topic, "bullets": [summary[:200]]}]
+
+    return slides[:8]
+
+def _generate_presentation_structure(user_id: int, topic: str) -> list[dict[str, list[str]]]:
+    prompt = (
+        "Составь краткую структуру презентации по теме ниже. Верни строго JSON-массив, "
+        "каждый элемент — объект вида {\"title\": \"...\", \"bullets\": [\"...\"]}. "
+        "5–7 слайдов: вступление, 3-4 основного материала, финал. "
+        "В каждом слайде не больше 5 буллетов, формулируй их коротко (до 15 слов). "
+        f"Тема: {topic!r}"
+    )
+    raw = ask_llm(user_id, prompt)
+    slides: list[dict[str, list[str]]] = []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "")).strip() or topic
+                bullets = item.get("bullets") or []
+                if isinstance(bullets, str):
+                    bullets = [bullets]
+                clean_bullets = [str(b).strip()[:200] for b in bullets if str(b).strip()]
+                slides.append({"title": title[:120], "bullets": clean_bullets[:5] or ["(пусто)"]})
+    except Exception:
+        slides = []
+
+    if not slides:
+        slides = _parse_slides_from_text(raw, topic)
+
+    return slides[:8]
+
+def _build_presentation_file(slides: list[dict[str, list[str]]], path: Path, topic: str):
+    prs = Presentation()
+
+    title_layout = prs.slide_layouts[0]
+    title_slide = prs.slides.add_slide(title_layout)
+    if title_slide.shapes.title:
+        title_slide.shapes.title.text = topic
+    try:
+        subtitle = title_slide.placeholders[1]
+        subtitle.text = "Сгенерировано NeuroBot 🤖"
+    except Exception:
+        pass
+
+    content_layout = prs.slide_layouts[1]
+    for idx, slide_data in enumerate(slides, start=1):
+        slide = prs.slides.add_slide(content_layout)
+        if slide.shapes.title:
+            slide.shapes.title.text = slide_data.get("title") or f"Слайд {idx}"
+        try:
+            text_frame = slide.shapes.placeholders[1].text_frame
+        except Exception:
+            continue
+        text_frame.clear()
+        bullets = slide_data.get("bullets") or []
+        for bullet_idx, bullet in enumerate(bullets):
+            paragraph = text_frame.paragraphs[0] if bullet_idx == 0 else text_frame.add_paragraph()
+            paragraph.text = bullet
+            paragraph.level = 0
+            if paragraph.font:
+                paragraph.font.size = Pt(24)
+
+    prs.save(str(path))
+
 # =========================
 # Длинные ответы: нарезка и "Показать ещё"
 # =========================
@@ -577,7 +716,8 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧠 Выбрать модель", callback_data="models")],
         [InlineKeyboardButton("🎛 Режимы", callback_data="modes")],
         [InlineKeyboardButton("💬 Диалоги", callback_data="dialog")],
-        [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img")],
+        [InlineKeyboardButton("🖼️ Создать картинку", callback_data="img"),
+         InlineKeyboardButton("🗂️ Презентация", callback_data="ppt")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("🎁 Реферальная программа", callback_data="ref")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help:how"),
@@ -914,6 +1054,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🎧 <b>Озвучивать ответы голосом</b> — нажми кнопку «Озвучить» под сообщением\n"
         "• 📄 <b>Работать с документами</b> (.txt, .md, .csv, .pdf): краткие выжимки и ключевые пункты\n"
         "• 📷 <b>Понимать фотографии/скриншоты</b>: описание и извлечение важных деталей\n\n"
+        "• 🎙️ <b>Распознавать голосовые сообщения</b> и отвечать как текстом, так и голосом\n"
+        "• 🗂️ <b>Готовить презентации в PPTX</b> по команде /ppt\n\n"
         "👇 Выбирай, с чего начать:"
     )
 
@@ -1205,6 +1347,7 @@ async def on_help_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📄 Отправляй документы (.txt, .md, .csv, .pdf) — сделаю краткое резюме.\n"
         "• 📷 Присылай фото или скриншоты — опишу, что на них.\n"
         "• Нужна картинка? Команда /img.\n"
+        "• 🗂️ Генерируй презентации — /ppt <тема>.\n"
         "• Выбор модели — /models.\n"
         "• Переключить режим — /mode.\n"
         "• Профиль и рефералка — /profile, /ref.\n"
@@ -1236,6 +1379,24 @@ async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
         [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
     ]))
+
+async def on_ppt_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    text = (
+        "🗂️ <b>Генерация презентаций</b>\n\n"
+        "Отправьте команду вида:\n"
+        "<code>/ppt тема презентации</code>\n\n"
+        "Например: <code>/ppt План вывода нового продукта</code>.\n"
+        "Доступно для пользователей с Премиум-подпиской."
+    )
+    try:
+        await q.message.edit_text(text, parse_mode="HTML")
+    except Exception:
+        await q.message.reply_text(text, parse_mode="HTML")
 
 # =========================
 # Оплата (CryptoPay)
@@ -1360,6 +1521,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📄 Отправляй документы (.txt, .md, .csv, .pdf) — я сделаю краткое резюме.\n"
         "• 📷 Присылай фото или скриншоты — расскажу, что на них.\n"
         "• Нужна картинка? Команда /img.\n"
+        "• 🗂️ Генерируй презентации — /ppt <тема>.\n"
         "• Выбор модели — /models.\n"
         "• Переключить режим — /mode.\n"
         "• Профиль и рефералка — /profile, /ref.\n"
@@ -1367,17 +1529,82 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Кнопки ниже — быстрый доступ:"
     )
     await update.message.reply_text(txt, parse_mode="HTML", reply_markup=main_keyboard())
+
+async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /ppt — сгенерировать PPTX по теме."""
+    user_id = update.effective_user.id
+    topic = " ".join(context.args).strip() if context.args else ""
+    if not topic:
+        await update.message.reply_text(
+            "Использование: /ppt <тема/задача>.\n"
+            "Например: /ppt маркетинговая стратегия для нового продукта."
+        )
+        return
+
+    if not await is_premium(user_id):
+        await update.message.reply_text(
+            "Генерация презентаций доступна только в Премиум.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💳 Купить подписку", callback_data="buy")]]
+            ),
+        )
+        return
+
+    status = await update.message.reply_text("🧩 Составляю структуру презентации…")
+    ppt_path: Path | None = None
+    try:
+        slides = _generate_presentation_structure(user_id, topic)
+        if not slides:
+            raise RuntimeError("Не удалось собрать структуру презентации.")
+
+        tmpdir = Path(tempfile.gettempdir())
+        ppt_path = tmpdir / f"presentation_{user_id}_{int(time.time())}.pptx"
+        _build_presentation_file(slides, ppt_path, topic)
+
+        try:
+            await status.edit_text("📤 Отправляю файл…")
+        except Exception:
+            pass
+
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", topic)[:40] or "presentation"
+        with open(ppt_path, "rb") as doc:
+            await update.message.reply_document(
+                document=doc,
+                filename=f"{safe_name}.pptx",
+                caption="Презентация готова ✅",
+            )
+    except Exception as e:
+        try:
+            await status.edit_text(f"Не удалось создать презентацию: {e}")
+        except Exception:
+            await update.message.reply_text(f"Не удалось создать презентацию: {e}")
+        return
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if ppt_path:
+            try:
+                ppt_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
 # =========================
 # Сообщения пользователей
 # =========================
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
-    text = update.message.text or ""
+    text = text or ""
+
+    if not text.strip():
+        await update.message.reply_text("Сообщение пустое. Пожалуйста, отправьте текст.")
+        return
 
     # Переименование чата — если ждём от пользователя новое имя
     if _pending_chat_rename.get(user_id):
         cid = _pending_chat_rename[user_id]
-        new_title = (text or "").strip()[:80]
+        new_title = text.strip()[:80]
         if not new_title:
             await update.message.reply_text(
                 "Название пустое. Отправьте текст от 1 до 80 символов или нажмите «Отмена» в меню."
@@ -1476,6 +1703,43 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(parts[0], reply_markup=kb)
     return
 
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    await _handle_text_request(update, context, text)
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    status = await update.message.reply_text("🎙️ Распознаю голос…")
+
+    tmpdir = Path(tempfile.gettempdir())
+    audio_path = tmpdir / f"voice_{user_id}_{int(time.time())}.ogg"
+
+    try:
+        data = await _download_telegram_file(context.bot, update.message.voice.file_id)
+        with open(audio_path, "wb") as f:
+            f.write(data)
+        transcript = await asyncio.to_thread(_transcribe_audio_file_sync, audio_path)
+        transcript = (transcript or "").strip()
+    except Exception as e:
+        await status.edit_text(f"Не удалось распознать голос: {e}")
+        return
+    finally:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not transcript:
+        await status.edit_text("Не удалось распознать голосовое сообщение.")
+        return
+
+    try:
+        await status.edit_text(f"📝 Распознано: {transcript}")
+    except Exception:
+        pass
+
+    await _handle_text_request(update, context, transcript)
 
 # =========================
 # Обработчик фото
@@ -1895,6 +2159,7 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("models", cmd_models))
     app_.add_handler(CommandHandler("mode",   cmd_mode))
     app_.add_handler(CommandHandler("help",   cmd_help))
+    app_.add_handler(CommandHandler("ppt",    cmd_ppt))
     app_.add_handler(CommandHandler("support", cmd_support))
     app_.add_handler(CommandHandler("faq",     cmd_faq))
 
@@ -1913,6 +2178,7 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_model_visual_select, pattern=r"^mvis:sel:.+$"))
     app_.add_handler(CallbackQueryHandler(on_modes_btn,    pattern=r"^modes$"))
     app_.add_handler(CallbackQueryHandler(on_mode_select,  pattern=r"^mode:(default|coding|seo|translate|summarize|creative)$"))
+    app_.add_handler(CallbackQueryHandler(on_ppt_btn,      pattern=r"^ppt$"))
     app_.add_handler(CallbackQueryHandler(
         lambda u, c: u.callback_query.message.edit_text("Главное меню:", reply_markup=main_keyboard()),
         pattern=r"^home$"
@@ -1926,6 +2192,7 @@ def build_application() -> Application:
 
     # сообщения
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app_.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, on_voice))
     # вложения
     app_.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, on_photo))
     app_.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, on_document))
