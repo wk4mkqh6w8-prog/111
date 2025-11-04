@@ -1,6 +1,9 @@
 import os
+import json
+import hmac
 import logging
 import asyncio
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta
@@ -11,6 +14,7 @@ from pathlib import Path
 from pypdf import PdfReader  # pip install PyPDF2
 from gtts import gTTS  # ← добавь импорт рядом с остальными
 
+import httpx
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -193,6 +197,7 @@ from db import (  # noqa
     get_usage_today, get_free_credits, consume_free_credit, add_free_credits,
     set_referrer_if_empty, count_paid_users_today, count_paid_users_total,
     get_premium_expires, list_expired_unnotified, mark_expired_notified,
+    revoke_premium,
     # новые:
     get_chat_mode, set_chat_mode, create_chat, list_chats,
     set_active_chat, get_active_chat, add_chat_message, get_chat_history,
@@ -1184,6 +1189,45 @@ async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # Оплата (CryptoPay)
 # =========================
+async def _create_crypto_invoice_link(user_id: int) -> str:
+    if not CRYPTOPAY_KEY:
+        raise RuntimeError("Оплата не подключена (нет CRYPTOPAY_KEY).")
+
+    payload = str(user_id)
+    headers = {"Crypto-Pay-API-Token": CRYPTOPAY_KEY}
+    data = {
+        "asset": "USDT",
+        "amount": PRICE_USDT,
+        "description": f"Подписка на 30 дней ({PRICE_RUB_TEXT})",
+        "payload": payload,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://pay.crypt.bot/api/createInvoice",
+                json=data,
+                headers=headers,
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:400] if exc.response is not None else str(exc)
+        raise RuntimeError(f"CryptoPay вернул ошибку: {detail}") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"CryptoPay недоступен: {exc}") from exc
+
+    try:
+        payload_json = response.json()
+    except ValueError as exc:
+        raise RuntimeError("CryptoPay вернул некорректный JSON.") from exc
+
+    result = payload_json.get("result") or {}
+    url = result.get("pay_url")
+    if not url:
+        raise RuntimeError(f"Не удалось получить ссылку оплаты: {payload_json}")
+    return url
+
+
 async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
@@ -1195,17 +1239,11 @@ async def on_buy_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Оплата не подключена (нет CRYPTOPAY_KEY).")
         return
 
-    payload = str(q.from_user.id)
-    headers = {"Crypto-Pay-API-Token": CRYPTOPAY_KEY}
-    data = {
-        "asset": "USDT",
-        "amount": PRICE_USDT,
-        "description": f"Подписка на 30 дней ({PRICE_RUB_TEXT})",
-        "payload": payload,
-    }
-    r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
-    j = r.json()
-    url = j["result"]["pay_url"]
+    try:
+        url = await _create_crypto_invoice_link(q.from_user.id)
+    except Exception as e:
+        await q.message.reply_text(f"Не удалось создать счёт: {e}")
+        return
 
     text = (
     f"Оплата подписки на 30 дней: <b>{PRICE_RUB_TEXT}</b>\n\n"
@@ -1227,17 +1265,11 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Оплата не подключена (нет CRYPTOPAY_KEY).")
         return
 
-    payload = str(update.effective_user.id)
-    headers = {"Crypto-Pay-API-Token": CRYPTOPAY_KEY}
-    data = {
-        "asset": "USDT",
-        "amount": PRICE_USDT,
-        "description": f"Подписка на 30 дней ({PRICE_RUB_TEXT})",
-        "payload": payload,
-    }
-    r = requests.post("https://pay.crypt.bot/api/createInvoice", json=data, headers=headers, timeout=15)
-    j = r.json()
-    url = j["result"]["pay_url"]
+    try:
+        url = await _create_crypto_invoice_link(update.effective_user.id)
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось создать счёт: {e}")
+        return
 
     text = (
     f"Оплата подписки на 30 дней: <b>{PRICE_RUB_TEXT}</b>\n\n"
@@ -1578,7 +1610,7 @@ async def cmd_remove_premium(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("Формат: /remove_pремиum <user_id>")
             return
         uid = int(context.args[0])
-        await set_premium(uid, (datetime.now() - timedelta(days=1)).isoformat())
+        await revoke_premium(uid)
         await update.message.reply_text(f"❎ Премиум снят у {uid}.")
         try:
             await application.bot.send_message(uid, "⚠️ Ваш премиум был отключён.")
@@ -1626,8 +1658,34 @@ async def telegram_webhook(request: Request):
 async def cryptopay_webhook(request: Request):
     """Обработчик вебхуков Crypto Pay (update_type=invoice_paid)."""
     global application
+    if not CRYPTOPAY_KEY:
+        return {"ok": False, "error": "cryptopay disabled"}
+
     try:
-        data = await request.json()
+        raw_body = await request.body()
+    except Exception:
+        return {"ok": False, "error": "bad body"}
+
+    signature = (
+        request.headers.get("Crypto-Pay-Signature")
+        or request.headers.get("X-Crypto-Pay-Signature")
+        or request.headers.get("X-CryptoPay-Signature")
+    )
+    if not signature:
+        logger.warning("CryptoPay webhook: missing signature header")
+        return {"ok": False, "error": "signature missing"}
+
+    expected_sig = hmac.new(
+        CRYPTOPAY_KEY.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature.strip().lower(), expected_sig):
+        logger.warning("CryptoPay webhook: invalid signature")
+        return {"ok": False, "error": "invalid signature"}
+
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
     except Exception:
         return {"ok": False, "error": "bad json"}
 

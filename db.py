@@ -279,6 +279,16 @@ async def set_premium(user_id: int, expires_at_iso: str):
             "INSERT INTO premium_events(user_id, activated_at) VALUES (?, ?)",
             (user_id, now),
         )
+        await db.execute(
+            """
+            INSERT INTO premium_notices(user_id, expired_notified, last_warn_at)
+            VALUES (?, 0, NULL)
+            ON CONFLICT(user_id) DO UPDATE SET
+              expired_notified = 0,
+              last_warn_at     = NULL
+            """,
+            (user_id,),
+        )
         await db.commit()
 
 
@@ -286,6 +296,7 @@ async def revoke_premium(user_id: int):
     """Снять премиум (удалить запись из premiums)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM premiums WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM premium_notices WHERE user_id = ?", (user_id,))
         await db.commit()
 
 async def get_premium_expires(user_id: int) -> str | None:
