@@ -1001,9 +1001,44 @@ def _replicate_generate_sync(prompt: str, width: int = 1024, height: int = 1024)
     return output
 
 
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+
+def _translate_to_english(text: str) -> str:
+    try:
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional translator. Translate the user's prompt into concise, natural English "
+                    "suitable for an image generation model. Respond with the translation only."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        translated = _oai_chat_call(messages=msgs, model="gpt-4o-mini", temperature=0.0)
+        return translated.strip()
+    except Exception:
+        return text
+
+
+def _prepare_image_prompt(prompt: str) -> str:
+    text = (prompt or "").strip()
+    if not text:
+        return text
+
+    if _CYRILLIC_RE.search(text):
+        translated = _translate_to_english(text)
+        translated = translated.strip().strip('"').strip("'")
+        if translated and translated.lower() != "none":
+            return f"{translated}. Original description (Russian): {text}"
+    return text
+
+
 async def generate_image_and_send(user_id: int, chat_id: int, prompt: str, bot) -> None:
     try:
-        urls = await asyncio.to_thread(_replicate_generate_sync, prompt)
+        prepared_prompt = _prepare_image_prompt(prompt)
+        urls = await asyncio.to_thread(_replicate_generate_sync, prepared_prompt)
         if not urls:
             await bot.send_message(chat_id=chat_id, text="Не удалось получить изображение.")
             return
