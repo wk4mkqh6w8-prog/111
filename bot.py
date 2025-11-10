@@ -3220,6 +3220,9 @@ async def cryptopay_webhook(request: Request):
     except Exception:
         return {"ok": False, "error": "bad body"}
 
+    headers_dict = dict(request.headers)
+    logger.warning("CryptoPay headers: %s", headers_dict)
+
     signature = (
         request.headers.get("Crypto-Pay-Signature")
         or request.headers.get("X-Crypto-Pay-Signature")
