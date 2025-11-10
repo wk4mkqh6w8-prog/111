@@ -3227,6 +3227,7 @@ async def cryptopay_webhook(request: Request):
         request.headers.get("Crypto-Pay-Signature")
         or request.headers.get("X-Crypto-Pay-Signature")
         or request.headers.get("X-CryptoPay-Signature")
+        or request.headers.get("crypto-pay-api-signature")
     )
     if not signature:
         logger.warning("CryptoPay webhook: missing signature header")
