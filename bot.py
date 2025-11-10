@@ -3220,9 +3220,6 @@ async def cryptopay_webhook(request: Request):
     except Exception:
         return {"ok": False, "error": "bad body"}
 
-    headers_dict = dict(request.headers)
-    logger.warning("CryptoPay headers: %s", headers_dict)
-
     signature = (
         request.headers.get("Crypto-Pay-Signature")
         or request.headers.get("X-Crypto-Pay-Signature")
@@ -3233,11 +3230,8 @@ async def cryptopay_webhook(request: Request):
         logger.warning("CryptoPay webhook: missing signature header")
         return {"ok": False, "error": "signature missing"}
 
-    expected_sig = hmac.new(
-        CRYPTOPAY_KEY.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
+    secret = hashlib.sha256(CRYPTOPAY_KEY.encode("utf-8")).digest()
+    expected_sig = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature.strip().lower(), expected_sig):
         logger.warning("CryptoPay webhook: invalid signature")
         return {"ok": False, "error": "invalid signature"}
