@@ -425,6 +425,15 @@ async def count_paid_users_total() -> int:
         return int(n)
 
 
+async def count_users_total() -> int:
+    """Сколько всего уникальных пользователей в базе."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        n = (await cur.fetchone())[0]
+        await cur.close()
+        return int(n)
+
+
 async def list_recent_purchases(days: int) -> list[tuple[int, str | None, str]]:
     """Возвращает список покупателей премиума за последние days дней."""
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
