@@ -12,6 +12,7 @@ import html
 import textwrap
 from types import SimpleNamespace
 from datetime import datetime, timedelta
+import math
 
 import base64
 import shutil
@@ -305,7 +306,8 @@ from db import (  # noqa
     get_user_profile_settings, set_user_profile_value, DEFAULT_PROFILE,
     add_favorite_prompt, list_favorite_prompts, get_favorite_prompt, delete_favorite_prompt,
     set_chat_pinned, create_chat_share, get_chat_share, cleanup_chat_shares,
-    get_chat_history_all
+    get_chat_history_all, list_recent_purchases, list_new_users,
+    list_active_premiums_with_expiry
 )
 
 # =========================
@@ -326,6 +328,13 @@ PRICE_TEXT = "$5"
 # --- Диалоговые режимы ---
 DIALOG_SIMPLE = "simple"  # Быстрые ответы (без памяти)
 DIALOG_ROOMS  = "rooms"   # Диалоги с контекстом (чаты)
+
+ADMIN_PERIODS = {
+    "day": ("24 часа", 1),
+    "week": ("7 дней", 7),
+    "month": ("30 дней", 30),
+}
+ADMIN_LIST_LIMIT = 30
 
 # ---------- LLM ----------
 def _compose_prompt(user_id: int, user_text: str, profile: dict[str, str] | None = None) -> list[dict]:
@@ -2020,7 +2029,7 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await add_user(user.id)
+    await add_user(user.id, user.username)
 
     # deep-link параметр: /start ref_<tg_id>
     ref_id = None
@@ -2633,6 +2642,10 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Сообщение пустое. Пожалуйста, отправьте текст.")
         return
 
+    tg_user = update.effective_user
+    if tg_user:
+        await add_user(user_id, tg_user.username)
+
     await _ensure_profile(user_id)
 
     normalized = text.strip().lower()
@@ -2711,7 +2724,7 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             await update.message.reply_text(
                 "🚫 Лимит исчерпан.\n"
-                f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+                f"— Дневной лимит: {DAILY_LIMIT} запросов/день\n"
                 f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
                 "Купите подписку «💳 Купить подписку» для безлимита."
             )
@@ -2780,6 +2793,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await add_user(user_id, update.effective_user.username if update.effective_user else None)
     status = await update.message.reply_text("🎙️ Распознаю голос…")
 
     tmpdir = Path(tempfile.gettempdir())
@@ -2816,6 +2830,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await add_user(user_id, update.effective_user.username if update.effective_user else None)
         # --- КД на отправку фото (для всех, включая премиум) ---
     now = time.time()
     until = _photo_cd_until.get(user_id, 0)
@@ -2834,7 +2849,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "🚫 Лимит исчерпан.\n"
-                f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+                f"— Дневной лимит: {DAILY_LIMIT} запросов/день\n"
                 f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
                 "Купите подписку «💳 Купить подписку» для безлимита."
             )
@@ -2883,6 +2898,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await add_user(user_id, update.effective_user.username if update.effective_user else None)
 
     # лимиты
     if not await is_premium(user_id):
@@ -2893,7 +2909,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "🚫 Лимит исчерпан.\n"
-                f"— Дневной лимит: {DAILY_LIMIT}/день\n"
+                f"— Дневной лимит: {DAILY_LIMIT} запросов/день\n"
                 f"— Реферальные бонусы: получите +{REF_BONUS} заявок!\n\n"
                 "Купите подписку «💳 Купить подписку» для безлимита."
             )
@@ -2952,21 +2968,64 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # Админ-команды
 # =========================
+def _admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Покупки", callback_data="admin:buyers")],
+        [InlineKeyboardButton("👋 Новые пользователи", callback_data="admin:new")],
+        [InlineKeyboardButton("💎 Активные премиумы", callback_data="admin:active")],
+    ])
+
+
+async def _admin_panel_text() -> str:
+    paid_today = await count_paid_users_today()
+    paid_total = await count_paid_users_total()
+    return (
+        "📊 <b>Админ-панель</b>\n\n"
+        f"Покупок сегодня: <b>{paid_today}</b>\n"
+        f"Активных премиумов: <b>{paid_total}</b>\n\n"
+        "Выберите раздел ниже, чтобы получить подробный отчёт.\n\n"
+        "<i>Команды: /add_premium &lt;user_id&gt; &lt;days&gt;, "
+        "/remove_premium &lt;user_id&gt;, /broadcast &lt;text&gt;</i>"
+    )
+
+
+def _admin_period_keyboard(kind: str) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(label, callback_data=f"admin:{kind}:{key}")
+        for key, (label, _) in ADMIN_PERIODS.items()
+    ]
+    rows = [buttons]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_handle(uid: int, username: str | None) -> str:
+    if username:
+        return f"@{html.escape(username)}"
+    return f"ID <code>{uid}</code>"
+
+
+def _format_ts(ts: str) -> str:
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return ts
+    return dt.strftime("%d.%m %H:%M")
+
+
+async def _admin_edit_or_reply(q, text: str, kb: InlineKeyboardMarkup):
+    try:
+        await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Нет доступа.")
         return
-    paid_today = await count_paid_users_today()
-    paid_total = await count_paid_users_total()
-    await update.message.reply_text(
-        "📊 Админ-панель\n"
-        f"Покупок сегодня: {paid_today}\n"
-        f"Всего активных премиумов: {paid_total}\n\n"
-        "Команды:\n"
-        "/add_premium <user_id> <days>\n"
-        "/remove_premium <user_id>\n"
-        "/broadcast <text>"
-    )
+    text = await _admin_panel_text()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_admin_panel_keyboard())
 
 async def cmd_add_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -3012,6 +3071,116 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = " ".join(context.args)
     await update.message.reply_text(f"Ок, отправлю: {text}\n(реальную рассылку можно дописать в db.py)")
+
+
+async def on_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    text = await _admin_panel_text()
+    await _admin_edit_or_reply(q, text, _admin_panel_keyboard())
+
+
+async def on_admin_buyers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    kb = _admin_period_keyboard("buyers")
+    await _admin_edit_or_reply(q, "🛒 Выберите период для списка покупок:", kb)
+
+
+async def on_admin_newusers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    kb = _admin_period_keyboard("new")
+    await _admin_edit_or_reply(q, "👋 Выберите период для новых пользователей:", kb)
+
+
+def _admin_list_text(title: str, rows: list[tuple[int, str | None, str]]) -> str:
+    if not rows:
+        return f"{title}\n\nНет записей."
+    lines = [title, ""]
+    for uid, username, ts in rows[:ADMIN_LIST_LIMIT]:
+        handle = _format_handle(uid, username)
+        lines.append(f"• {handle} — {html.escape(_format_ts(ts))}")
+    if len(rows) > ADMIN_LIST_LIMIT:
+        lines.append(f"... и ещё {len(rows) - ADMIN_LIST_LIMIT}")
+    return "\n".join(lines)
+
+
+async def on_admin_buyers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    period = q.data.split("admin:buyers:", 1)[-1]
+    label, days = ADMIN_PERIODS.get(period, ("24 часа", 1))
+    rows = await list_recent_purchases(days)
+    text = _admin_list_text(f"🛒 Покупки за {label}: <b>{len(rows)}</b>", rows)
+    await _admin_edit_or_reply(q, text, _admin_period_keyboard("buyers"))
+
+
+async def on_admin_newusers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    period = q.data.split("admin:new:", 1)[-1]
+    label, days = ADMIN_PERIODS.get(period, ("24 часа", 1))
+    rows = await list_new_users(days)
+    text = _admin_list_text(f"👋 Новые пользователи за {label}: <b>{len(rows)}</b>", rows)
+    await _admin_edit_or_reply(q, text, _admin_period_keyboard("new"))
+
+
+async def on_admin_active_premiums(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    rows = await list_active_premiums_with_expiry()
+    if not rows:
+        text = "💎 Активных премиумов нет."
+    else:
+        now = datetime.utcnow()
+        lines = [f"💎 Активные премиумы: <b>{len(rows)}</b>", ""]
+        for uid, username, expires_at in rows[:ADMIN_LIST_LIMIT]:
+            handle = _format_handle(uid, username)
+            try:
+                exp_dt = datetime.fromisoformat(expires_at)
+                remaining = exp_dt - now
+                days_left = max(0, math.ceil(remaining.total_seconds() / 86400))
+                expiry_text = exp_dt.strftime("%d.%m %H:%M")
+            except Exception:
+                days_left = 0
+                expiry_text = expires_at
+            lines.append(f"• {handle} — до {expiry_text} (≈{days_left} дн.)")
+        if len(rows) > ADMIN_LIST_LIMIT:
+            lines.append(f"... и ещё {len(rows) - ADMIN_LIST_LIMIT}")
+        text = "\n".join(lines)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")]])
+    await _admin_edit_or_reply(q, text, kb)
 
 # =========================
 # Webhooks
@@ -3289,6 +3458,12 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_profile_btn,  pattern=r"^profile$"))
     app_.add_handler(CallbackQueryHandler(on_settings_btn, pattern=r"^settings$"))
     app_.add_handler(CallbackQueryHandler(on_settings_change, pattern=r"^settings:(style|language|format|theme):.+$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_panel, pattern=r"^admin:panel$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_buyers_menu, pattern=r"^admin:buyers$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_newusers_menu, pattern=r"^admin:new$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_buyers_list, pattern=r"^admin:buyers:(day|week|month)$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_newusers_list, pattern=r"^admin:new:(day|week|month)$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_active_premiums, pattern=r"^admin:active$"))
     app_.add_handler(CallbackQueryHandler(on_ref_btn,      pattern=r"^ref$"))
     app_.add_handler(CallbackQueryHandler(on_models_btn,   pattern=r"^models$"))
     app_.add_handler(CallbackQueryHandler(on_models_view_toggle, pattern=r"^mvis:(short|full)$"))

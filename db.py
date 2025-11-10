@@ -49,7 +49,8 @@ async def init_db():
                 user_id       INTEGER PRIMARY KEY,
                 created_at    TEXT    NOT NULL,
                 referrer_id   INTEGER,
-                free_credits  INTEGER NOT NULL DEFAULT 0
+                free_credits  INTEGER NOT NULL DEFAULT 0,
+                username      TEXT
             );
 
             -- Сообщения пользователя (для дневного лимита)
@@ -145,21 +146,25 @@ async def init_db():
         await _ensure_column(db, "user_prefs", "output_format", "TEXT NOT NULL DEFAULT 'plain'")
         await _ensure_column(db, "user_prefs", "theme", "TEXT NOT NULL DEFAULT 'auto'")
         await _ensure_column(db, "chats", "is_pinned", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "users", "username", "TEXT")
 
         await db.commit()
 
 
 # ========= ПОЛЬЗОВАТЕЛИ / РЕФЕРАЛКИ =========
 
-async def add_user(user_id: int):
-    """Создаём запись о пользователе, если её ещё нет."""
+async def add_user(user_id: int, username: str | None = None):
+    """Создаём/обновляем запись о пользователе."""
+    uname = (username or "").strip() or None
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT OR IGNORE INTO users(user_id, created_at, referrer_id, free_credits)
-            VALUES (?, ?, NULL, 0)
+            INSERT INTO users(user_id, created_at, referrer_id, free_credits, username)
+            VALUES (?, ?, NULL, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              username = COALESCE(EXCLUDED.username, users.username)
             """,
-            (user_id, _utcnow_iso()),
+            (user_id, _utcnow_iso(), uname),
         )
         await db.commit()
 
@@ -418,6 +423,62 @@ async def count_paid_users_total() -> int:
         n = (await cur.fetchone())[0]
         await cur.close()
         return int(n)
+
+
+async def list_recent_purchases(days: int) -> list[tuple[int, str | None, str]]:
+    """Возвращает список покупателей премиума за последние days дней."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT pe.user_id, u.username, pe.activated_at
+            FROM premium_events pe
+            LEFT JOIN users u ON u.user_id = pe.user_id
+            WHERE pe.activated_at >= ?
+            ORDER BY pe.activated_at DESC
+            """,
+            (cutoff,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1], r[2]) for r in rows]
+
+
+async def list_new_users(days: int) -> list[tuple[int, str | None, str]]:
+    """Возвращает новых пользователей за период."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT user_id, username, created_at
+            FROM users
+            WHERE created_at >= ?
+            ORDER BY created_at DESC
+            """,
+            (cutoff,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1], r[2]) for r in rows]
+
+
+async def list_active_premiums_with_expiry() -> list[tuple[int, str | None, str]]:
+    """Возвращает пользователей с активным премиумом и датой окончания."""
+    now = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT p.user_id, u.username, p.expires_at
+            FROM premiums p
+            LEFT JOIN users u ON u.user_id = p.user_id
+            WHERE p.expires_at > ?
+            ORDER BY p.expires_at ASC
+            """,
+            (now,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1], r[2]) for r in rows]
 
 # ========= ДИАЛОГОВЫЕ РЕЖИМЫ И ЧАТЫ =========
 
