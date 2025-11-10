@@ -174,10 +174,6 @@ def _update_profile_cache(user_id: int, field: str, value: str):
     profile = _user_profiles.setdefault(user_id, dict(DEFAULT_PROFILE))
     profile[field] = value
 
-
-def _format_human_number(value: int) -> str:
-    return f"{value:,}".replace(",", " ")
-
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
     "default": {
@@ -311,7 +307,19 @@ from db import (  # noqa
     add_favorite_prompt, list_favorite_prompts, get_favorite_prompt, delete_favorite_prompt,
     set_chat_pinned, create_chat_share, get_chat_share, cleanup_chat_shares,
     get_chat_history_all, list_recent_purchases, list_new_users,
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
+    list_active_pремиумs_with_expiry
+=======
+    list_active_premiums_with_expiry
+>>>>>>> theirs
+=======
     list_active_premiums_with_expiry, count_users_total
+>>>>>>> theirs
+=======
+    list_active_premiums_with_expiry
+>>>>>>> theirs
 )
 
 # =========================
@@ -339,7 +347,6 @@ ADMIN_PERIODS = {
     "month": ("30 дней", 30),
 }
 ADMIN_LIST_LIMIT = 30
-DESCRIPTION_UPDATE_INTERVAL = 3600  # seconds
 
 # ---------- LLM ----------
 def _compose_prompt(user_id: int, user_text: str, profile: dict[str, str] | None = None) -> list[dict]:
@@ -3417,31 +3424,6 @@ async def _premium_expiry_notifier_loop():
             logger.warning("premium notifier error: %s", e)
         await asyncio.sleep(900)  # 15 минут
 
-
-async def _refresh_bot_description():
-    total = await count_users_total()
-    pretty = _format_human_number(total)
-    desc = f"{pretty} пользователей"
-    short_desc = "AI помощник: чат, документы, презентации"
-    try:
-        await application.bot.set_my_description(description=desc)
-    except Exception as e:
-        logger.warning("set description failed: %s", e)
-    try:
-        await application.bot.set_my_short_description(short_description=short_desc)
-    except Exception as e:
-        logger.warning("set short description failed: %s", e)
-
-
-async def _description_updater_loop():
-    await asyncio.sleep(20)
-    while True:
-        try:
-            await _refresh_bot_description()
-        except Exception as e:
-            logger.warning("description updater error: %s", e)
-        await asyncio.sleep(DESCRIPTION_UPDATE_INTERVAL)
-
 # =========================
 # Глобальный error-handler PTB (чтобы не падал на 400)
 # =========================
@@ -3559,7 +3541,6 @@ async def on_startup():
     threading.Thread(target=_keepalive_loop, daemon=True).start()
     asyncio.get_event_loop().create_task(_webhook_guard_loop())
     asyncio.get_event_loop().create_task(_premium_expiry_notifier_loop())
-    asyncio.get_event_loop().create_task(_description_updater_loop())
 
     logger.info("🚀 Startup complete. Listening on port %s", PORT)
 
