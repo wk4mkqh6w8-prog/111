@@ -2318,6 +2318,7 @@ def _faq_text() -> str:
 def _support_text() -> str:
     return (
         "<b>Техподдержка</b>\n\n"
+        "• Telegram: <a href='https://t.me/neurobotaisupport'>@neurobotaisupport</a>\n"
         f"• Email: <a href='mailto:{SUPPORT_EMAIL}'>{SUPPORT_EMAIL}</a>\n"
         f"• Время ответа: в рабочие часы {SUPPORT_WORK_HOURS}\n\n"
         "В письме укажите: ID в Telegram (из Профиля), кратко суть вопроса, скрин/ошибку и время события."
@@ -2331,7 +2332,7 @@ async def on_help_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 FAQ", callback_data="help:faq"),
-         InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+         InlineKeyboardButton("🛟 Техподдержка", url="https://t.me/neurobotaisupport")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
         [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
@@ -2345,7 +2346,7 @@ async def on_help_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+        [InlineKeyboardButton("🛟 Техподдержка", url="https://t.me/neurobotaisupport")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
         [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
     ])
@@ -2358,6 +2359,7 @@ async def on_help_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛟 Написать в Telegram", url="https://t.me/neurobotaisupport")],
         [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
         [InlineKeyboardButton("📚 FAQ", callback_data="help:faq")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
@@ -2391,7 +2393,7 @@ async def on_help_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # мини-меню помощи с быстрыми ссылками
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 FAQ",          callback_data="help:faq"),
-         InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+         InlineKeyboardButton("🛟 Техподдержка", url="https://t.me/neurobotaisupport")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
         [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
     ])
@@ -2400,6 +2402,7 @@ async def on_help_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Команды-псевдонимы
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_support_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛟 Написать в Telegram", url="https://t.me/neurobotaisupport")],
         [InlineKeyboardButton("✉️ Написать на email", url=f"mailto:{SUPPORT_EMAIL}")],
         [InlineKeyboardButton("📚 FAQ", callback_data="help:faq")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
@@ -2408,7 +2411,7 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_faq_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛟 Техподдержка", callback_data="help:support")],
+        [InlineKeyboardButton("🛟 Техподдержка", url="https://t.me/neurobotaisupport")],
         [InlineKeyboardButton("📄 Публичная оферта", url=PUBLIC_OFFER_URL)],
         [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
     ]))
