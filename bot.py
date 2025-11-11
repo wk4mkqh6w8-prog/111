@@ -362,33 +362,50 @@ def _oai_chat_call(messages: list[dict], model: str, temperature: float = 0.7) -
 # DB helpers
 # =========================
 from db import (  # noqa
-    init_db, add_user, is_premium, can_send_message, set_premium,
-    get_usage_today, get_free_credits, consume_free_credit, add_free_credits,
-    set_referrer_if_empty, count_paid_users_today, count_paid_users_total,
-    get_premium_expires, list_expired_unnotified, mark_expired_notified,
+    init_db,
+    add_user,
+    is_premium,
+    can_send_message,
+    set_premium,
+    get_usage_today,
+    get_free_credits,
+    consume_free_credit,
+    add_free_credits,
+    set_referrer_if_empty,
+    count_paid_users_today,
+    count_paid_users_total,
+    get_premium_expires,
+    list_expired_unnotified,
+    mark_expired_notified,
     revoke_premium,
     # новые:
-    get_chat_mode, set_chat_mode, create_chat, list_chats,
-    set_active_chat, get_active_chat, add_chat_message, get_chat_history,
-    rename_chat, delete_chat,
-    get_user_profile_settings, set_user_profile_value, DEFAULT_PROFILE,
-    add_favorite_prompt, list_favorite_prompts, get_favorite_prompt, delete_favorite_prompt,
-    set_chat_pinned, create_chat_share, get_chat_share, cleanup_chat_shares,
-    get_chat_history_all, list_recent_purchases, list_new_users,
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-    list_active_pремиумs_with_expiry
-=======
-    list_active_premiums_with_expiry
->>>>>>> theirs
-=======
-    list_active_premiums_with_expiry, count_users_total
->>>>>>> theirs
-=======
-    list_active_premiums_with_expiry
->>>>>>> theirs
+    get_chat_mode,
+    set_chat_mode,
+    create_chat,
+    list_chats,
+    set_active_chat,
+    get_active_chat,
+    add_chat_message,
+    get_chat_history,
+    rename_chat,
+    delete_chat,
+    get_user_profile_settings,
+    set_user_profile_value,
+    DEFAULT_PROFILE,
+    add_favorite_prompt,
+    list_favorite_prompts,
+    get_favorite_prompt,
+    delete_favorite_prompt,
+    set_chat_pinned,
+    create_chat_share,
+    get_chat_share,
+    cleanup_chat_shares,
+    get_chat_history_all,
+    list_recent_purchases,
+    list_new_users,
+    list_active_premiums_with_expiry,
 )
+
 
 # =========================
 # FastAPI & PTB
