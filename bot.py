@@ -35,7 +35,7 @@ import uvicorn
 from fpdf import FPDF
 
 from openai import OpenAI
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
+from telegram import Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, ApplicationBuilder,
     CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -72,6 +72,75 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("neurobot")
+
+
+_original_edit_text = Message.edit_text
+_HTML_TAG_RE = re.compile(r"</?[^>]+?>")
+_HTML_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _normalize_html_visible_text(text: str) -> str:
+    if not text:
+        return ""
+    text = _HTML_BR_RE.sub("\n", text)
+    text = _HTML_TAG_RE.sub("", text)
+    return html.unescape(text)
+
+
+def _parse_mode_name(value) -> str | None:
+    if isinstance(value, str):
+        return value
+    inner = getattr(value, "value", None)
+    return inner if isinstance(inner, str) else None
+
+
+def _keyboard_signature(markup) -> str | None:
+    if markup is None:
+        return None
+    if hasattr(markup, "to_dict"):
+        markup = markup.to_dict()
+    try:
+        return json.dumps(markup, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return repr(markup)
+
+
+def _extract_optional_arg(args, kwargs, index: int, key: str):
+    if key in kwargs:
+        return kwargs[key]
+    if len(args) > index:
+        return args[index]
+    return None
+
+
+async def _patched_edit_text(self, text: str, *args, **kwargs):
+    parse_mode = _extract_optional_arg(args, kwargs, 0, "parse_mode")
+    reply_markup = _extract_optional_arg(args, kwargs, 1, "reply_markup")
+    parse_mode_name = (_parse_mode_name(parse_mode) or "").lower()
+
+    new_plain = (
+        _normalize_html_visible_text(text)
+        if parse_mode_name == "html"
+        else (text or "")
+    )
+    current_plain = self.text or ""
+
+    markup_same = _keyboard_signature(reply_markup) == _keyboard_signature(self.reply_markup)
+
+    if new_plain == current_plain and markup_same:
+        logger.debug("Skip edit_text for message %s: unchanged content/markup", getattr(self, "message_id", "?"))
+        return self
+
+    try:
+        return await _original_edit_text(self, text, *args, **kwargs)
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            logger.debug("Telegram rejected edit_text as unchanged for message %s", getattr(self, "message_id", "?"))
+            return self
+        raise
+
+
+Message.edit_text = _patched_edit_text
 
 # Модели (реальные — для движка)
 MODEL_OPENAI   = "OpenAI · GPT-4o-mini"
@@ -148,7 +217,6 @@ QUICK_COMMANDS_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
     selective=True,
 )
-
 
 async def _ensure_profile(user_id: int) -> dict[str, str]:
     profile = _user_profiles.get(user_id)
