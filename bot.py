@@ -157,6 +157,8 @@ _long_reply_queue: dict[int, list[str]] = {}  # очереди «показат�
 _photo_cd_until: dict[int, float] = {}  # user_id -> unix timestamp до которого фото нельзя слать
 _user_profiles: dict[int, dict[str, str]] = {}
 _last_user_prompt: dict[int, str] = {}
+_admin_pending_template: set[int] = set()
+_pending_broadcast_payload: dict[int, tuple[str, str]] = {}
 
 PROFILE_STYLES = {
     "standard": "Стандарт",
@@ -404,6 +406,11 @@ from db import (  # noqa
     list_recent_purchases,
     list_new_users,
     list_active_premiums_with_expiry,
+    add_broadcast_template,
+    list_broadcast_templates,
+    delete_broadcast_template,
+    get_broadcast_template,
+    list_all_user_ids,
 )
 
 
@@ -432,6 +439,9 @@ ADMIN_PERIODS = {
     "month": ("30 дней", 30),
 }
 ADMIN_LIST_LIMIT = 30
+BROADCAST_TEMPLATE_LIMIT = 8
+BROADCAST_SLEEP_SHORT = 0.02
+BROADCAST_SLEEP_LONG = 0.6
 
 # ---------- LLM ----------
 def _compose_prompt(user_id: int, user_text: str, profile: dict[str, str] | None = None) -> list[dict]:
@@ -2742,6 +2752,29 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Сообщение пустое. Пожалуйста, отправьте текст.")
         return
 
+    if user_id == ADMIN_ID and user_id in _admin_pending_template:
+        payload = text.strip()
+        if payload.lower() in ("отмена", "cancel"):
+            _admin_pending_template.discard(user_id)
+            await update.message.reply_text("Добавление шаблона отменено.")
+            return
+        lines = payload.splitlines()
+        title = (lines[0] if lines else "Шаблон").strip()
+        body = payload
+        if not title or len(body) < 5:
+            await update.message.reply_text(
+                "Слишком коротко. Первая строка — название кнопки, далее текст сообщения. "
+                "Отправьте шаблон ещё раз или напишите «отмена».",
+            )
+            return
+        tpl_id = await add_broadcast_template(title, body)
+        _admin_pending_template.discard(user_id)
+        await update.message.reply_text(
+            f"Шаблон «{title[:60]}» сохранён (ID {tpl_id}).\n"
+            "Найдёте его в разделе «📢 Рассылки».",
+        )
+        return
+
     tg_user = update.effective_user
     if tg_user:
         await add_user(user_id, tg_user.username)
@@ -3073,6 +3106,7 @@ def _admin_panel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛒 Покупки", callback_data="admin:buyers")],
         [InlineKeyboardButton("👋 Новые пользователи", callback_data="admin:new")],
         [InlineKeyboardButton("💎 Активные премиумы", callback_data="admin:active")],
+        [InlineKeyboardButton("📢 Рассылки", callback_data="admin:broadcast")],
     ])
 
 
@@ -3087,6 +3121,51 @@ async def _admin_panel_text() -> str:
         "<i>Команды: /add_premium &lt;user_id&gt; &lt;days&gt;, "
         "/remove_premium &lt;user_id&gt;, /broadcast &lt;text&gt;</i>"
     )
+
+
+def _broadcast_keyboard(templates: list[tuple[int, str, str, str]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for tid, title, *_ in templates[:BROADCAST_TEMPLATE_LIMIT]:
+        short = textwrap.shorten(title, width=34, placeholder="…")
+        rows.append([
+            InlineKeyboardButton(f"▶️ {short}", callback_data=f"admin:broadcast:send:{tid}"),
+            InlineKeyboardButton("🗑", callback_data=f"admin:broadcast:del:{tid}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Добавить шаблон", callback_data="admin:broadcast:add")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _broadcast_menu_payload(extra_note: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    templates = await list_broadcast_templates()
+    lines = [
+        "📢 <b>Рассылки</b>",
+        "Создавайте шаблоны и отправляйте их всем пользователям в один клик.",
+    ]
+    if templates:
+        lines.append("")
+        for tid, title, _, created in templates[:BROADCAST_TEMPLATE_LIMIT]:
+            ts = _format_ts(created)
+            lines.append(f"• <b>{html.escape(title)}</b> — ID {tid}, {ts}")
+        if len(templates) > BROADCAST_TEMPLATE_LIMIT:
+            lines.append(f"... и ещё {len(templates) - BROADCAST_TEMPLATE_LIMIT} шаблонов")
+    else:
+        lines.append("")
+        lines.append("Шаблонов пока нет. Нажмите «➕ Добавить шаблон»,")
+        lines.append("первая строка — название, остальные строки — текст сообщения.")
+    if extra_note:
+        lines.extend(["", extra_note])
+    kb = _broadcast_keyboard(templates)
+    return "\n".join(lines), kb
+
+
+def _broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Отправить всем", callback_data="admin:broadcast:confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="admin:broadcast:cancel"),
+        ]
+    ])
 
 
 def _admin_period_keyboard(kind: str) -> InlineKeyboardMarkup:
@@ -3118,6 +3197,66 @@ async def _admin_edit_or_reply(q, text: str, kb: InlineKeyboardMarkup):
         await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+def _broadcast_label(title: str) -> str:
+    return title.strip() or "Рассылка"
+
+
+async def _request_broadcast_confirmation(bot, admin_id: int, title: str, body: str):
+    """Сохраняем текст и отправляем предпросмотр админу для подтверждения."""
+    _pending_broadcast_payload[admin_id] = (title, body)
+    body_html = html.escape(body).replace("\n", "<br>")
+    preview = (
+        f"📢 <b>Предпросмотр рассылки</b>\n"
+        f"Название: <b>{html.escape(_broadcast_label(title))}</b>\n\n"
+        f"{body_html}\n\n"
+        "Нажмите «✅ Отправить всем», чтобы подтвердить, или «❌ Отмена», чтобы отменить."
+    )
+    await bot.send_message(
+        chat_id=admin_id,
+        text=preview,
+        parse_mode="HTML",
+        reply_markup=_broadcast_confirm_keyboard(),
+    )
+
+
+async def _start_broadcast_job(title: str, body: str, initiated_by: int):
+    """Фан-аут рассылки в отдельной таске."""
+    if application is None:
+        raise RuntimeError("application is not initialized")
+
+    async def _job():
+        user_ids = await list_all_user_ids()
+        total = len(user_ids)
+        sent = 0
+        failed = 0
+        for idx, uid in enumerate(user_ids, start=1):
+            try:
+                await application.bot.send_message(
+                    uid,
+                    body,
+                    disable_notification=True,
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.debug("broadcast to %s failed: %s", uid, e)
+            if idx % 25 == 0:
+                await asyncio.sleep(BROADCAST_SLEEP_LONG)
+            else:
+                await asyncio.sleep(BROADCAST_SLEEP_SHORT)
+        summary = (
+            f"📢 Рассылка «{html.escape(title)}» завершена.\n"
+            f"Успешно: <b>{sent}</b> из {total}\n"
+            f"Ошибок: <b>{failed}</b>"
+        )
+        try:
+            await application.bot.send_message(initiated_by, summary, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("Не удалось отправить отчёт о рассылке админу: %s", e)
+
+    asyncio.create_task(_job())
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3169,8 +3308,20 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Формат: /broadcast <text>")
         return
-    text = " ".join(context.args)
-    await update.message.reply_text(f"Ок, отправлю: {text}\n(реальную рассылку можно дописать в db.py)")
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Текст пустой.")
+        return
+    if update.effective_user.id in _pending_broadcast_payload:
+        await update.message.reply_text("Сначала подтвердите или отмените предыдущую рассылку.")
+        return
+    await update.message.reply_text("Отправил предпросмотр вам в личку. Проверьте текст и подтвердите.")
+    await _request_broadcast_confirmation(
+        context.bot,
+        update.effective_user.id,
+        "Произвольное сообщение",
+        text,
+    )
 
 
 async def on_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3281,6 +3432,120 @@ async def on_admin_active_premiums(update: Update, context: ContextTypes.DEFAULT
         text = "\n".join(lines)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")]])
     await _admin_edit_or_reply(q, text, kb)
+
+
+async def _show_broadcast_menu(q, note: str | None = None):
+    text, kb = await _broadcast_menu_payload(note)
+    await _admin_edit_or_reply(q, text, kb)
+
+
+async def on_admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    await _show_broadcast_menu(q)
+
+
+async def on_admin_broadcast_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer("Отправьте текст шаблона в чат с ботом")
+    except Exception:
+        pass
+    if q.from_user.id in _admin_pending_template:
+        await context.bot.send_message(
+            ADMIN_ID,
+            "Я всё ещё жду текст для шаблона. Отправьте сообщение или напишите «отмена».",
+        )
+        return
+    _admin_pending_template.add(q.from_user.id)
+    await context.bot.send_message(
+        ADMIN_ID,
+        "Отправьте текст шаблона рассылки.\n"
+        "• Первая строка станет названием кнопки (до 60 символов)\n"
+        "• Остальной текст уйдёт пользователям как есть\n"
+        "Напишите «отмена», чтобы отменить.",
+    )
+
+
+async def on_admin_broadcast_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    tpl_id = int(q.data.split(":")[-1])
+    ok = await delete_broadcast_template(tpl_id)
+    try:
+        await q.answer("Удалено" if ok else "Не найдено")
+    except Exception:
+        pass
+    await _show_broadcast_menu(q, "Шаблон удалён." if ok else "Шаблон не найден.")
+
+
+async def on_admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    tpl_id = int(q.data.split(":")[-1])
+    tpl = await get_broadcast_template(tpl_id)
+    if not tpl:
+        try:
+            await q.answer("Не найдено")
+        except Exception:
+            pass
+        await _show_broadcast_menu(q, "Шаблон не найден.")
+        return
+    _, title, content, _ = tpl
+    if ADMIN_ID in _pending_broadcast_payload:
+        note = "Сначала подтвердите или отмените предыдущую рассылку."
+        await _show_broadcast_menu(q, note)
+        return
+    try:
+        await q.answer("Отправил предпросмотр")
+    except Exception:
+        pass
+    await _show_broadcast_menu(q, f"Проверьте текст рассылки «{html.escape(title)}».")
+    await _request_broadcast_confirmation(context.bot, ADMIN_ID, title, content)
+
+
+async def on_admin_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    payload = _pending_broadcast_payload.pop(ADMIN_ID, None)
+    try:
+        await q.answer("Рассылка запущена" if payload else "Нечего отправлять")
+    except Exception:
+        pass
+    if not payload:
+        await context.bot.send_message(ADMIN_ID, "Нет подготовленной рассылки.")
+        return
+    title, body = payload
+    await context.bot.send_message(
+        ADMIN_ID,
+        f"🚀 Запускаю рассылку «{title}». Отчёт пришлю после завершения.",
+    )
+    await _start_broadcast_job(_broadcast_label(title), body, ADMIN_ID)
+
+
+async def on_admin_broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    had = _pending_broadcast_payload.pop(ADMIN_ID, None)
+    try:
+        await q.answer("Отменено" if had else "Нечего отменять")
+    except Exception:
+        pass
+    await context.bot.send_message(
+        ADMIN_ID,
+        "Рассылка отменена." if had else "Подтверждать было нечего.",
+    )
 
 # =========================
 # Webhooks
@@ -3558,6 +3823,12 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_settings_change, pattern=r"^settings:(style|language|format|theme):.+$"))
     app_.add_handler(CallbackQueryHandler(on_admin_panel, pattern=r"^admin:panel$"))
     app_.add_handler(CallbackQueryHandler(on_admin_buyers_menu, pattern=r"^admin:buyers$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_broadcast_menu, pattern=r"^admin:broadcast$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_broadcast_add, pattern=r"^admin:broadcast:add$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_broadcast_send, pattern=r"^admin:broadcast:send:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_broadcast_delete, pattern=r"^admin:broadcast:del:\d+$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_broadcast_confirm, pattern=r"^admin:broadcast:confirm$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_broadcast_cancel, pattern=r"^admin:broadcast:cancel$"))
     app_.add_handler(CallbackQueryHandler(on_admin_newusers_menu, pattern=r"^admin:new$"))
     app_.add_handler(CallbackQueryHandler(on_admin_buyers_list, pattern=r"^admin:buyers:(day|week|month)$"))
     app_.add_handler(CallbackQueryHandler(on_admin_newusers_list, pattern=r"^admin:new:(day|week|month)$"))

@@ -137,6 +137,14 @@ async def init_db():
                 expires_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_chat_shares_exp ON chat_shares(expires_at);
+
+            -- Шаблоны рассылок
+            CREATE TABLE IF NOT EXISTS broadcast_templates (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -479,6 +487,73 @@ async def list_active_premiums_with_expiry() -> list[tuple[int, str | None, str]
         rows = await cur.fetchall()
         await cur.close()
         return [(int(r[0]), r[1], r[2]) for r in rows]
+
+# ========= Рассылки / шаблоны =========
+
+async def add_broadcast_template(title: str, content: str) -> int:
+    """Создаёт шаблон рассылки и возвращает его ID."""
+    title = (title or "").strip() or "Без названия"
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("content is empty")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO broadcast_templates(title, content, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (title[:80], content, _utcnow_iso()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_broadcast_templates() -> list[tuple[int, str, str, str]]:
+    """Возвращает все шаблоны рассылок."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, title, content, created_at
+            FROM broadcast_templates
+            ORDER BY created_at DESC
+            """
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1], r[2], r[3]) for r in rows]
+
+
+async def get_broadcast_template(template_id: int) -> tuple[int, str, str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, title, content, created_at
+            FROM broadcast_templates
+            WHERE id = ?
+            """,
+            (template_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return int(row[0]), row[1], row[2], row[3]
+
+
+async def delete_broadcast_template(template_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM broadcast_templates WHERE id = ?", (template_id,))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def list_all_user_ids() -> list[int]:
+    """Возвращает список всех пользователей (для рассылок)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users ORDER BY user_id ASC")
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
 
 # ========= ДИАЛОГОВЫЕ РЕЖИМЫ И ЧАТЫ =========
 
