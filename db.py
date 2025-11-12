@@ -145,6 +145,31 @@ async def init_db():
                 content    TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            -- События воронки (по одному событию каждого типа на пользователя)
+            CREATE TABLE IF NOT EXISTS funnel_events (
+                user_id    INTEGER NOT NULL,
+                event      TEXT    NOT NULL,
+                created_at TEXT    NOT NULL,
+                PRIMARY KEY (user_id, event)
+            );
+
+            -- Логи отправленных вовлекающих сообщений
+            CREATE TABLE IF NOT EXISTS engagement_events (
+                user_id    INTEGER NOT NULL,
+                event      TEXT    NOT NULL,
+                created_at TEXT    NOT NULL,
+                sent_at    TEXT    NOT NULL,
+                PRIMARY KEY (user_id, event)
+            );
+
+            -- Настройки вовлекающих сценариев
+            CREATE TABLE IF NOT EXISTS engagement_settings (
+                event      TEXT PRIMARY KEY,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                message    TEXT    NOT NULL,
+                updated_at TEXT    NOT NULL
+            );
             """
         )
 
@@ -155,6 +180,9 @@ async def init_db():
         await _ensure_column(db, "user_prefs", "theme", "TEXT NOT NULL DEFAULT 'auto'")
         await _ensure_column(db, "chats", "is_pinned", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "users", "username", "TEXT")
+        await _ensure_column(db, "users", "used_ppt", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "users", "used_image", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "users", "last_seen_at", "TEXT")
 
         await db.commit()
 
@@ -225,6 +253,33 @@ async def add_free_credits(user_id: int, n: int):
         await db.execute(
             "UPDATE users SET free_credits = COALESCE(free_credits,0) + ? WHERE user_id = ?",
             (n, user_id),
+        )
+        await db.commit()
+
+
+async def update_last_seen(user_id: int):
+    """Обновляет отметку последней активности пользователя."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_seen_at = ? WHERE user_id = ?",
+            (_utcnow_iso(), user_id),
+        )
+        await db.commit()
+
+
+async def mark_feature_used(user_id: int, feature: str):
+    """Помечает, что пользователь воспользовался конкретной функцией (ppt/image)."""
+    column = None
+    if feature == "ppt":
+        column = "used_ppt"
+    elif feature == "image":
+        column = "used_image"
+    if not column:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE users SET {column} = 1 WHERE user_id = ? AND ( {column} IS NULL OR {column} = 0 )",
+            (user_id,),
         )
         await db.commit()
 
@@ -554,6 +609,252 @@ async def list_all_user_ids() -> list[int]:
         rows = await cur.fetchall()
         await cur.close()
         return [int(r[0]) for r in rows]
+
+
+# ========= Пользовательские выборки для триггеров =========
+
+async def list_users_without_feature(feature: str, limit: int = 30, recent_days: int = 3) -> list[int]:
+    col = "used_ppt" if feature == "ppt" else "used_image"
+    if col not in {"used_ppt", "used_image"}:
+        return []
+    cutoff = (datetime.utcnow() - timedelta(days=recent_days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            f"""
+            SELECT user_id
+            FROM users
+            WHERE ({col} IS NULL OR {col} = 0)
+              AND last_seen_at IS NOT NULL
+              AND last_seen_at >= ?
+            ORDER BY last_seen_at DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+
+async def list_inactive_users(days: int, limit: int = 50) -> list[int]:
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT user_id
+            FROM users
+            WHERE last_seen_at IS NOT NULL
+              AND last_seen_at < ?
+            ORDER BY last_seen_at ASC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+
+async def list_recent_active_free_users(hours: int, limit: int = 50) -> list[int]:
+    now = datetime.utcnow()
+    cutoff = (now - timedelta(hours=hours)).isoformat()
+    now_iso = now.isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT u.user_id
+            FROM users u
+            LEFT JOIN premiums p ON p.user_id = u.user_id
+            WHERE u.last_seen_at IS NOT NULL
+              AND u.last_seen_at >= ?
+              AND (p.expires_at IS NULL OR p.expires_at <= ?)
+            ORDER BY u.last_seen_at DESC
+            LIMIT ?
+            """,
+            (cutoff, now_iso, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+
+async def list_premiums_expiring_within(hours: int, limit: int = 200) -> list[tuple[int, str]]:
+    now = datetime.utcnow()
+    start = now.isoformat()
+    end = (now + timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT user_id, expires_at
+            FROM premiums
+            WHERE expires_at > ?
+              AND expires_at <= ?
+            ORDER BY expires_at ASC
+            LIMIT ?
+            """,
+            (start, end, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(int(r[0]), r[1]) for r in rows]
+
+
+async def list_premiums_expired_between(min_hours: int, max_hours: int, limit: int = 200) -> list[int]:
+    now = datetime.utcnow()
+    older = (now - timedelta(hours=max_hours)).isoformat()
+    newer = (now - timedelta(hours=min_hours)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT user_id
+            FROM premiums
+            WHERE expires_at >= ?
+              AND expires_at <= ?
+            ORDER BY expires_at ASC
+            LIMIT ?
+            """,
+            (older, newer, limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+
+# ========= Воронка =========
+
+async def log_funnel_event(user_id: int, event: str):
+    """Фиксирует событие воронки (сохраняется только первое для сочетания user+event)."""
+    if not event:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO funnel_events(user_id, event, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, event, _utcnow_iso()),
+        )
+        await db.commit()
+
+
+async def get_funnel_counts(days: int | None = None) -> dict[str, int]:
+    """Возвращает число уникальных пользователей по каждому событию."""
+    query = "SELECT event, COUNT(DISTINCT user_id) FROM funnel_events"
+    params: list = []
+    if days is not None:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        query += " WHERE created_at >= ?"
+        params.append(cutoff)
+    query += " GROUP BY event"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(query, params)
+        rows = await cur.fetchall()
+        await cur.close()
+    return {row[0]: int(row[1]) for row in rows}
+
+
+async def get_engagement_last(user_id: int, kind: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT sent_at FROM engagement_events WHERE user_id = ? AND event = ?",
+            (user_id, kind),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
+
+
+async def mark_engagement_sent(user_id: int, kind: str):
+    now_iso = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO engagement_events(user_id, event, created_at, sent_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, event) DO UPDATE SET
+                sent_at = excluded.sent_at,
+                created_at = COALESCE(engagement_events.created_at, excluded.created_at)
+            """,
+            (user_id, kind, now_iso, now_iso),
+        )
+        await db.commit()
+
+
+async def ensure_engagement_setting(event: str, default_text: str):
+    if not event:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO engagement_settings(event, enabled, message, updated_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(event) DO NOTHING
+            """,
+            (event, default_text, _utcnow_iso()),
+        )
+        await db.commit()
+
+
+async def get_engagement_settings() -> list[tuple[str, int, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT event, enabled, message FROM engagement_settings ORDER BY event"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(row[0], int(row[1]), row[2]) for row in rows]
+
+
+async def get_engagement_message(event: str) -> tuple[int, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT enabled, message FROM engagement_settings WHERE event = ?",
+            (event,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return int(row[0]), row[1]
+
+
+async def set_engagement_enabled(event: str, enabled: bool):
+    val = 1 if enabled else 0
+    now_iso = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM engagement_settings WHERE event = ?", (event,))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            await db.execute(
+                "INSERT INTO engagement_settings(event, enabled, message, updated_at) VALUES (?, 1, '', ?)",
+                (event, now_iso),
+            )
+        await db.execute(
+            "UPDATE engagement_settings SET enabled = ?, updated_at = ? WHERE event = ?",
+            (val, now_iso, event),
+        )
+        await db.commit()
+
+
+async def set_engagement_message(event: str, text: str):
+    now_iso = _utcnow_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM engagement_settings WHERE event = ?", (event,))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            await db.execute(
+                "INSERT INTO engagement_settings(event, enabled, message, updated_at) VALUES (?, 1, ?, ?)",
+                (event, text, now_iso),
+            )
+        else:
+            await db.execute(
+                "UPDATE engagement_settings SET message = ?, updated_at = ? WHERE event = ?",
+                (text, now_iso, event),
+            )
+        await db.commit()
 
 # ========= ДИАЛОГОВЫЕ РЕЖИМЫ И ЧАТЫ =========
 

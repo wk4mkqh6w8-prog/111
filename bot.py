@@ -158,6 +158,7 @@ _photo_cd_until: dict[int, float] = {}  # user_id -> unix timestamp до кот�
 _user_profiles: dict[int, dict[str, str]] = {}
 _last_user_prompt: dict[int, str] = {}
 _admin_pending_template: set[int] = set()
+_pending_engagement_edit: dict[int, str] = {}
 _pending_broadcast_payload: dict[int, tuple[str, str]] = {}
 
 PROFILE_STYLES = {
@@ -243,6 +244,145 @@ def _profile_snapshot(user_id: int) -> dict[str, str]:
 def _update_profile_cache(user_id: int, field: str, value: str):
     profile = _user_profiles.setdefault(user_id, dict(DEFAULT_PROFILE))
     profile[field] = value
+
+
+async def _track_funnel_event(user_id: int, event: str):
+    if not user_id or not event:
+        return
+    try:
+        await log_funnel_event(user_id, event)
+    except Exception as e:
+        logger.debug("funnel log failed: %s", e)
+
+
+async def _note_user_activity(user_id: int):
+    try:
+        await update_last_seen(user_id)
+    except Exception as e:
+        logger.debug("last_seen update failed: %s", e)
+
+
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        if value.endswith("Z"):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return None
+
+
+async def _engagement_allowed(user_id: int, kind: str) -> bool:
+    now = datetime.utcnow()
+    global_last = _parse_iso_dt(await get_engagement_last(user_id, ENGAGEMENT_GLOBAL_KIND))
+    if global_last and now - global_last < ENGAGEMENT_COOLDOWN:
+        return False
+    kind_last = _parse_iso_dt(await get_engagement_last(user_id, kind))
+    if kind_last and now - kind_last < ENGAGEMENT_COOLDOWN:
+        return False
+    return True
+
+
+async def _mark_engagement(user_id: int, kind: str):
+    await mark_engagement_sent(user_id, kind)
+    await mark_engagement_sent(user_id, ENGAGEMENT_GLOBAL_KIND)
+
+
+async def _maybe_send_engagement(
+    user_id: int,
+    kind: str,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str = "HTML",
+) -> bool:
+    if application is None:
+        return False
+    if not await _engagement_allowed(user_id, kind):
+        return False
+    try:
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        logger.debug("engagement send failed (%s): %s", kind, e)
+        return False
+    await _mark_engagement(user_id, kind)
+    return True
+
+
+def _buy_keyboard(label: str = "💳 Продлить подписку") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="buy")]])
+
+
+def _scenario_label(kind: str) -> str:
+    return ENGAGEMENT_SCENARIOS.get(kind, {}).get("label", kind)
+
+
+def _scenario_keyboard(kind: str) -> InlineKeyboardMarkup | None:
+    cfg = ENGAGEMENT_SCENARIOS.get(kind) or {}
+    button = cfg.get("button", "none")
+    if button == "buy":
+        return _buy_keyboard(cfg.get("button_text", "💳 Купить подписку"))
+    if button == "main":
+        return main_keyboard()
+    return None
+
+
+async def _get_engagement_setting(kind: str) -> tuple[bool, str]:
+    cfg = ENGAGEMENT_SCENARIOS.get(kind, {})
+    default_text = cfg.get("default", "")
+    await ensure_engagement_setting(kind, default_text)
+    row = await get_engagement_message(kind)
+    if not row:
+        return True, default_text
+    enabled, text = row
+    return bool(enabled), (text or default_text)
+
+
+async def _engage_user(
+    user_id: int,
+    kind: str,
+    fmt: dict | None = None,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> bool:
+    enabled, template = await _get_engagement_setting(kind)
+    if not enabled:
+        return False
+    fmt = fmt or {}
+    try:
+        text = template.format(**fmt)
+    except Exception:
+        text = template
+    kb = keyboard or _scenario_keyboard(kind)
+    return await _maybe_send_engagement(user_id, kind, text, reply_markup=kb)
+
+
+async def _engagement_settings_map() -> dict[str, tuple[bool, str]]:
+    rows = await get_engagement_settings()
+    mapping = {event: (bool(enabled), text) for event, enabled, text in rows}
+    for key, cfg in ENGAGEMENT_SCENARIOS.items():
+        if key not in mapping:
+            await ensure_engagement_setting(key, cfg["default"])
+            mapping[key] = (True, cfg["default"])
+    return mapping
+
+
+async def _check_context_promos(user_id: int, text: str):
+    lower = (text or "").lower()
+    if any(word in lower for word in DESIGN_KEYWORDS):
+        sent = await _engage_user(user_id, ENGAGE_PROMO_DESIGN)
+        if sent:
+            return
+    if any(word in lower for word in CODING_KEYWORDS):
+        await _engage_user(user_id, ENGAGE_PROMO_CODING)
 
 # РЕЖИМЫ (ярлыки): реально влияют на подсказку
 TASK_MODES = {
@@ -411,6 +551,22 @@ from db import (  # noqa
     delete_broadcast_template,
     get_broadcast_template,
     list_all_user_ids,
+    log_funnel_event,
+    get_funnel_counts,
+    update_last_seen,
+    mark_feature_used,
+    list_users_without_feature,
+    list_inactive_users,
+    list_recent_active_free_users,
+    list_premiums_expiring_within,
+    list_premiums_expired_between,
+    get_engagement_last,
+    mark_engagement_sent,
+    ensure_engagement_setting,
+    get_engagement_settings,
+    get_engagement_message,
+    set_engagement_enabled,
+    set_engagement_message,
 )
 
 
@@ -442,6 +598,109 @@ ADMIN_LIST_LIMIT = 30
 BROADCAST_TEMPLATE_LIMIT = 8
 BROADCAST_SLEEP_SHORT = 0.02
 BROADCAST_SLEEP_LONG = 0.6
+FUNNEL_START = "start"
+FUNNEL_DEMO = "demo"
+FUNNEL_PAYWALL = "paywall"
+FUNNEL_TRIAL = "trial"
+FUNNEL_PAYMENT = "payment"
+FUNNEL_STEPS = [
+    (FUNNEL_START, "Стартовали"),
+    (FUNNEL_DEMO, "Получили демо"),
+    (FUNNEL_PAYWALL, "Увидели пейволл"),
+    (FUNNEL_TRIAL, "Использовали триал"),
+    (FUNNEL_PAYMENT, "Оплатили"),
+]
+ENGAGEMENT_GLOBAL_KIND = "__global__"
+ENGAGEMENT_COOLDOWN = timedelta(days=4)
+ENGAGE_VIP_PRE = "vip_pre_expiry"
+ENGAGE_VIP_RETURN = "vip_return"
+ENGAGE_FEATURE_PPT = "feature_ppt"
+ENGAGE_FEATURE_IMG = "feature_img"
+ENGAGE_FREE_UPSELL = "free_upsell"
+ENGAGE_INACTIVE = "inactive_ping"
+ENGAGE_PROMO_DESIGN = "promo_design"
+ENGAGE_PROMO_CODING = "promo_coding"
+ENGAGEMENT_SCENARIOS = {
+    ENGAGE_VIP_PRE: {
+        "label": "VIP · напоминание перед окончанием",
+        "short": "VIP -3д",
+        "default": (
+            "💎 <b>Премиум скоро закончится</b>\n"
+            "До конца подписки ≈{days} дн.\n\n"
+            "Продлите сейчас, чтобы сохранить генерацию изображений, презентации и безлимит."
+        ),
+        "placeholders": ["days"],
+        "button": "buy",
+        "button_text": "💳 Продлить сейчас",
+    },
+    ENGAGE_VIP_RETURN: {
+        "label": "VIP · вернуть после окончания",
+        "short": "VIP +48ч",
+        "default": (
+            "👋 Мы сохранили ваши чаты и шаблоны.\n"
+            "Продлите премиум, чтобы снова пользоваться изображениями, презентациями и безлимитными ответами."
+        ),
+        "button": "buy",
+        "button_text": "💳 Вернуться",
+    },
+    ENGAGE_FEATURE_PPT: {
+        "label": "Подсветка презентаций",
+        "short": "Хайлайт PPT",
+        "default": (
+            "🗂️ В Премиум доступны авто-презентации: команда <b>/ppt тема</b> собирает готовый deck с цветами и иллюстрациями."
+        ),
+        "button": "buy",
+        "button_text": "💳 Открыть Премиум",
+    },
+    ENGAGE_FEATURE_IMG: {
+        "label": "Подсветка изображений",
+        "short": "Хайлайт IMG",
+        "default": (
+            "🖼️ Попробуйте генерацию изображений: командой /img или кнопкой «Картинка» я создам визуал по описанию."
+        ),
+        "button": "buy",
+        "button_text": "💳 Открыть Премиум",
+    },
+    ENGAGE_FREE_UPSELL: {
+        "label": "Апселл для фритир-пользователей",
+        "short": "Фри → VIP",
+        "default": (
+            "🚀 Премиум всего {price} на 30 дней.\n"
+            "Безлимитные сообщения, генерация изображений и презентаций, приоритетные модели и режимы."
+        ),
+        "placeholders": ["price"],
+        "button": "buy",
+        "button_text": "💳 Оформить премиум",
+    },
+    ENGAGE_INACTIVE: {
+        "label": "Напоминание неактивным",
+        "short": "Inactive",
+        "default": (
+            "👋 Давненько не виделись! Я сохранил все чаты и подсказки — просто напишите сообщение, чтобы продолжить."
+        ),
+        "button": "main",
+    },
+    ENGAGE_PROMO_DESIGN: {
+        "label": "Контекст: дизайн",
+        "short": "Дизайн",
+        "default": (
+            "🎨 Похоже, вы работаете с дизайном. Включите генерацию изображений и собирайте визуалы по описанию."
+        ),
+        "button": "buy",
+        "button_text": "💎 Получить доступ",
+    },
+    ENGAGE_PROMO_CODING: {
+        "label": "Контекст: кодинг",
+        "short": "Кодинг",
+        "default": (
+            "👨‍💻 Режим «Кодинг» даёт длинные разборы и примеры. Премиум открывает безлимит и все модели."
+        ),
+        "button": "buy",
+        "button_text": "💎 Получить безлимит",
+    },
+}
+DESIGN_KEYWORDS = ("дизайн", "дизайнер", "баннер", "логотип", "визуал", "ui", "ux", "illustration", "poster")
+CODING_KEYWORDS = ("код", "python", "скрипт", "script", "ошибка", "bug", "исправь", "function", "sql", "алгоритм", "code")
 
 # ---------- LLM ----------
 def _compose_prompt(user_id: int, user_text: str, profile: dict[str, str] | None = None) -> list[dict]:
@@ -1331,6 +1590,7 @@ async def generate_image_and_send(user_id: int, chat_id: int, prompt: str, bot) 
             await bot.send_message(chat_id=chat_id, text="Не удалось получить изображение.")
             return
         await bot.send_photo(chat_id=chat_id, photo=urls[0], caption="Готово ✅")
+        await mark_feature_used(user_id, "image")
     except Exception as e:
         await bot.send_message(chat_id=chat_id, text=f"Ошибка генерации: {e}")
 
@@ -2118,6 +2378,8 @@ async def on_img_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await add_user(user_id, update.effective_user.username if update.effective_user else None)
+    await _note_user_activity(user_id)
     if not await is_premium(user_id):
         await update.message.reply_text(
             f"Генерация изображений доступна в Премиум ({PRICE_TEXT} / 30 дней).",
@@ -2137,6 +2399,7 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await add_user(user.id, user.username)
+    await _note_user_activity(user.id)
 
     # deep-link параметр: /start ref_<tg_id>
     ref_id = None
@@ -2195,6 +2458,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user.id, text="Быстрые команды доступны на клавиатуре ниже.", reply_markup=QUICK_COMMANDS_KEYBOARD)
         except Exception:
             pass
+    await _track_funnel_event(user.id, FUNNEL_START)
 
 
 # =========================
@@ -2391,6 +2655,8 @@ async def on_mode_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(f"✅ Режим «{lbl}» активирован. Готов работать!", reply_markup=main_keyboard())
     except Exception:
         await q.message.reply_text(f"✅ Режим «{lbl}» активирован. Готов работать!", reply_markup=main_keyboard())
+    if key == "coding":
+        await _engage_user(q.from_user.id, ENGAGE_PROMO_CODING)
 
 # =========================
 # Помощь / FAQ / Оферта
@@ -2676,6 +2942,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /ppt — сгенерировать PPTX по теме."""
     user_id = update.effective_user.id
+    await add_user(user_id, update.effective_user.username if update.effective_user else None)
+    await _note_user_activity(user_id)
     topic = " ".join(context.args).strip() if context.args else ""
     if not topic:
         await update.message.reply_text(
@@ -2719,6 +2987,7 @@ async def cmd_ppt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename=f"{safe_name}.pptx",
                 caption="Презентация готова ✅",
             )
+        await mark_feature_used(user_id, "ppt")
     except Exception as e:
         try:
             await status.edit_text(f"Не удалось создать презентацию: {e}")
@@ -2752,6 +3021,21 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Сообщение пустое. Пожалуйста, отправьте текст.")
         return
 
+    if user_id == ADMIN_ID and user_id in _pending_engagement_edit:
+        key = _pending_engagement_edit[user_id]
+        payload = text.strip()
+        if payload.lower() in ("отмена", "cancel"):
+            _pending_engagement_edit.pop(user_id, None)
+            await update.message.reply_text("Редактирование текста отменено.")
+            return
+        if not payload:
+            await update.message.reply_text("Текст пустой. Отправьте новый текст или напишите «отмена».")
+            return
+        await set_engagement_message(key, payload)
+        _pending_engagement_edit.pop(user_id, None)
+        await update.message.reply_text(f"Сценарий «{_scenario_label(key)}» обновлён.")
+        return
+
     if user_id == ADMIN_ID and user_id in _admin_pending_template:
         payload = text.strip()
         if payload.lower() in ("отмена", "cancel"):
@@ -2778,6 +3062,7 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
     tg_user = update.effective_user
     if tg_user:
         await add_user(user_id, tg_user.username)
+    await _note_user_activity(user_id)
 
     await _ensure_profile(user_id)
 
@@ -2853,7 +3138,7 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         if await can_send_message(user_id, limit=DAILY_LIMIT):
             pass
         elif await consume_free_credit(user_id):
-            pass
+            await _track_funnel_event(user_id, FUNNEL_TRIAL)
         else:
             await update.message.reply_text(
                 "🚫 Лимит исчерпан.\n"
@@ -2861,6 +3146,7 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
                 "Купите подписку «💳 Купить подписку» для безлимита."
             )
+            await _track_funnel_event(user_id, FUNNEL_PAYWALL)
             return
 
     # выбор по диалоговому режиму
@@ -2917,6 +3203,8 @@ async def _handle_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         InlineKeyboardButton("🧾 Сжать", callback_data="quick:summary"),
     ])
     await update.message.reply_text(parts[0], reply_markup=InlineKeyboardMarkup(buttons))
+    await _track_funnel_event(user_id, FUNNEL_DEMO)
+    await _check_context_promos(user_id, text)
     return
 
 
@@ -2927,6 +3215,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await add_user(user_id, update.effective_user.username if update.effective_user else None)
+    await _note_user_activity(user_id)
     status = await update.message.reply_text("🎙️ Распознаю голос…")
 
     tmpdir = Path(tempfile.gettempdir())
@@ -2964,7 +3253,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await add_user(user_id, update.effective_user.username if update.effective_user else None)
-        # --- КД на отправку фото (для всех, включая премиум) ---
+    await _note_user_activity(user_id)
+    # --- КД на отправку фото (для всех, включая премиум) ---
     now = time.time()
     until = _photo_cd_until.get(user_id, 0)
     if until > now:
@@ -2978,7 +3268,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await can_send_message(user_id, limit=DAILY_LIMIT):
             pass
         elif await consume_free_credit(user_id):
-            pass
+            await _track_funnel_event(user_id, FUNNEL_TRIAL)
         else:
             await update.message.reply_text(
                 "🚫 Лимит исчерпан.\n"
@@ -2986,6 +3276,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"— Реферальные бонусы: получите +{REF_BONUS} заявок за каждого приглашённого!\n\n"
                 "Купите подписку «💳 Купить подписку» для безлимита."
             )
+            await _track_funnel_event(user_id, FUNNEL_PAYWALL)
             return
 
     spinner = await update.message.reply_text("🤖 Генерация ответа…")
@@ -3025,6 +3316,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
         await update.message.reply_text(chunks[0], reply_markup=kb)
+    await _track_funnel_event(user_id, FUNNEL_DEMO)
 
 # =========================
 # Обработчик документов (.txt/.md/.csv/.pdf)
@@ -3032,13 +3324,14 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await add_user(user_id, update.effective_user.username if update.effective_user else None)
+    await _note_user_activity(user_id)
 
     # лимиты
     if not await is_premium(user_id):
         if await can_send_message(user_id, limit=DAILY_LIMIT):
             pass
         elif await consume_free_credit(user_id):
-            pass
+            await _track_funnel_event(user_id, FUNNEL_TRIAL)
         else:
             await update.message.reply_text(
                 "🚫 Лимит исчерпан.\n"
@@ -3046,6 +3339,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"— Реферальные бонусы: получите +{REF_BONUS} заявок!\n\n"
                 "Купите подписку «💳 Купить подписку» для безлимита."
             )
+            await _track_funnel_event(user_id, FUNNEL_PAYWALL)
             return
 
     doc = update.message.document
@@ -3094,6 +3388,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Озвучить", callback_data="tts")]])
             await update.message.reply_text(chunks[0], reply_markup=kb)
+        await _track_funnel_event(user_id, FUNNEL_DEMO)
 
     except Exception as e:
         await update.message.reply_text(f"Не удалось обработать документ: {e}")
@@ -3106,6 +3401,10 @@ def _admin_panel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛒 Покупки", callback_data="admin:buyers")],
         [InlineKeyboardButton("👋 Новые пользователи", callback_data="admin:new")],
         [InlineKeyboardButton("💎 Активные премиумы", callback_data="admin:active")],
+        [
+            InlineKeyboardButton("📉 Воронка", callback_data="admin:funnel"),
+            InlineKeyboardButton("📬 Триггеры", callback_data="admin:eng"),
+        ],
         [InlineKeyboardButton("📢 Рассылки", callback_data="admin:broadcast")],
     ])
 
@@ -3123,6 +3422,40 @@ async def _admin_panel_text() -> str:
     )
 
 
+async def _engagement_menu_payload(note: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    settings = await _engagement_settings_map()
+    lines = [
+        "📬 <b>Триггеры возвращения</b>",
+        "Включайте/выключайте сценарии и редактируйте тексты. "
+        "Каждый пользователь получает такие сообщения не чаще, чем раз в 4 дня.",
+        "",
+    ]
+    if note:
+        lines.extend([note, ""])
+    for key, cfg in ENGAGEMENT_SCENARIOS.items():
+        enabled, text = settings.get(key, (True, cfg.get("default", "")))
+        status = "🟢" if enabled else "⚪️"
+        snippet = textwrap.shorten(" ".join((text or "").split()), width=110, placeholder="…") or "(пусто)"
+        lines.append(f"{status} <b>{cfg['label']}</b>")
+        lines.append(snippet)
+        placeholders = cfg.get("placeholders")
+        if placeholders:
+            placeholders_fmt = ", ".join(f"{{{p}}}" for p in placeholders)
+            lines.append(f"Переменные: {placeholders_fmt}")
+        lines.append("")
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for key, cfg in ENGAGEMENT_SCENARIOS.items():
+        enabled, _ = settings.get(key, (True, cfg.get("default", "")))
+        toggle_label = "Выкл" if enabled else "Вкл"
+        kb_rows.append([
+            InlineKeyboardButton(f"{cfg.get('short', cfg['label'])}: {toggle_label}", callback_data=f"admin:eng:toggle:{key}"),
+            InlineKeyboardButton("✏️ Текст", callback_data=f"admin:eng:edit:{key}"),
+        ])
+    kb_rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")])
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(kb_rows)
+
+
 def _broadcast_keyboard(templates: list[tuple[int, str, str, str]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for tid, title, *_ in templates[:BROADCAST_TEMPLATE_LIMIT]:
@@ -3134,6 +3467,70 @@ def _broadcast_keyboard(templates: list[tuple[int, str, str, str]]) -> InlineKey
     rows.append([InlineKeyboardButton("➕ Добавить шаблон", callback_data="admin:broadcast:add")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")])
     return InlineKeyboardMarkup(rows)
+
+
+async def on_admin_engagement_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    text, kb = await _engagement_menu_payload()
+    await _admin_edit_or_reply(q, text, kb)
+
+
+async def on_admin_engagement_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    kind = q.data.split("admin:eng:toggle:", 1)[-1]
+    if kind not in ENGAGEMENT_SCENARIOS:
+        try:
+            await q.answer("Неизвестный сценарий")
+        except Exception:
+            pass
+        return
+    enabled, _ = await _get_engagement_setting(kind)
+    await set_engagement_enabled(kind, not enabled)
+    try:
+        await q.answer("Выкл" if enabled else "Вкл")
+    except Exception:
+        pass
+    text, kb = await _engagement_menu_payload()
+    await _admin_edit_or_reply(q, text, kb)
+
+
+async def on_admin_engagement_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    kind = q.data.split("admin:eng:edit:", 1)[-1]
+    if kind not in ENGAGEMENT_SCENARIOS:
+        try:
+            await q.answer("Неизвестный сценарий")
+        except Exception:
+            pass
+        return
+    _pending_engagement_edit[q.from_user.id] = kind
+    _, text = await _get_engagement_setting(kind)
+    placeholders = ENGAGEMENT_SCENARIOS[kind].get("placeholders")
+    hint = ""
+    if placeholders:
+        hint = "\nИспользуйте переменные: " + ", ".join(f"{{{p}}}" for p in placeholders)
+    try:
+        await q.answer("Жду текст")
+    except Exception:
+        pass
+    await context.bot.send_message(
+        chat_id=q.from_user.id,
+        text=(
+            f"Отправьте новый текст для сценария «{_scenario_label(kind)}»."
+            f"{hint}\nНапишите «отмена», чтобы отменить.\n\nТекущий текст:\n{text}"
+        ),
+        parse_mode="HTML",
+    )
 
 
 async def _broadcast_menu_payload(extra_note: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
@@ -3166,6 +3563,84 @@ def _broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("❌ Отмена", callback_data="admin:broadcast:cancel"),
         ]
     ])
+
+
+def _format_funnel_section(stats: dict[str, int]) -> list[str]:
+    lines: list[str] = []
+    prev_value: int | None = None
+    for key, label in FUNNEL_STEPS:
+        value = stats.get(key, 0)
+        if prev_value:
+            pct = f" ({int(value / prev_value * 100)}%)" if prev_value else ""
+        else:
+            pct = ""
+        lines.append(f"• {label}: <b>{value}</b>{pct}")
+        prev_value = value
+    return lines
+
+
+async def _funnel_report_text() -> str:
+    stats_day = await get_funnel_counts(days=1)
+    stats_all = await get_funnel_counts()
+    lines = ["📉 <b>Воронка пользователей</b>", ""]
+    lines.append("<b>За 24 часа</b>:")
+    lines.extend(_format_funnel_section(stats_day))
+    lines.append("")
+    lines.append("<b>За всё время</b>:")
+    lines.extend(_format_funnel_section(stats_all))
+    lines.append("")
+    lines.append("Статистика считает уникальных пользователей по каждому шагу.")
+    return "\n".join(lines)
+
+
+async def _send_vip_preexpiry_notifications():
+    rows = await list_premiums_expiring_within(72)
+    now = datetime.utcnow()
+    for uid, expires_at in rows:
+        exp_dt = _parse_iso_dt(expires_at)
+        if not exp_dt:
+            continue
+        days_left = max(1, math.ceil((exp_dt - now).total_seconds() / 86400))
+        await _engage_user(uid, ENGAGE_VIP_PRE, {"days": days_left})
+
+
+async def _send_vip_return_notifications():
+    rows = await list_premiums_expired_between(48, 72)
+    for uid in rows:
+        await _engage_user(uid, ENGAGE_VIP_RETURN)
+
+
+async def _send_feature_highlights():
+    ppt_users = await list_users_without_feature("ppt", limit=20)
+    for uid in ppt_users:
+        await _engage_user(uid, ENGAGE_FEATURE_PPT)
+    img_users = await list_users_without_feature("image", limit=20)
+    for uid in img_users:
+        await _engage_user(uid, ENGAGE_FEATURE_IMG)
+
+
+async def _send_free_user_upsells():
+    users = await list_recent_active_free_users(hours=24, limit=30)
+    for uid in users:
+        await _engage_user(uid, ENGAGE_FREE_UPSELL, {"price": PRICE_TEXT})
+
+
+async def _send_inactive_user_pings():
+    users = await list_inactive_users(days=2, limit=30)
+    for uid in users:
+        await _engage_user(uid, ENGAGE_INACTIVE)
+
+
+async def _engagement_trigger_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await _send_feature_highlights()
+            await _send_free_user_upsells()
+            await _send_inactive_user_pings()
+        except Exception as e:
+            logger.warning("engagement loop error: %s", e)
+        await asyncio.sleep(3600)
 
 
 def _admin_period_keyboard(kind: str) -> InlineKeyboardMarkup:
@@ -3439,6 +3914,19 @@ async def _show_broadcast_menu(q, note: str | None = None):
     await _admin_edit_or_reply(q, text, kb)
 
 
+async def on_admin_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    text = await _funnel_report_text()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")]])
+    await _admin_edit_or_reply(q, text, kb)
+
+
 async def on_admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
@@ -3642,6 +4130,7 @@ async def cryptopay_webhook(request: Request):
     if paid and user_id:
         expires_dt = datetime.now() + timedelta(days=30)
         await set_premium(user_id, expires_dt.isoformat())
+        await _track_funnel_event(user_id, FUNNEL_PAYMENT)
         try:
             text = (
                 "✅ <b>Оплата получена</b>!\n"
@@ -3743,6 +4232,8 @@ async def _premium_expiry_notifier_loop():
     await asyncio.sleep(10)
     while True:
         try:
+            await _send_vip_preexpiry_notifications()
+            await _send_vip_return_notifications()
             now_iso = datetime.utcnow().isoformat()
             user_ids = await list_expired_unnotified(now_iso)
             for uid in user_ids:
@@ -3823,6 +4314,10 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_settings_change, pattern=r"^settings:(style|language|format|theme):.+$"))
     app_.add_handler(CallbackQueryHandler(on_admin_panel, pattern=r"^admin:panel$"))
     app_.add_handler(CallbackQueryHandler(on_admin_buyers_menu, pattern=r"^admin:buyers$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_engagement_menu, pattern=r"^admin:eng$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_engagement_toggle, pattern=r"^admin:eng:toggle:.+$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_engagement_edit, pattern=r"^admin:eng:edit:.+$"))
+    app_.add_handler(CallbackQueryHandler(on_admin_funnel, pattern=r"^admin:funnel$"))
     app_.add_handler(CallbackQueryHandler(on_admin_broadcast_menu, pattern=r"^admin:broadcast$"))
     app_.add_handler(CallbackQueryHandler(on_admin_broadcast_add, pattern=r"^admin:broadcast:add$"))
     app_.add_handler(CallbackQueryHandler(on_admin_broadcast_send, pattern=r"^admin:broadcast:send:\d+$"))
@@ -3881,6 +4376,8 @@ def build_application() -> Application:
 async def on_startup():
     global application, _public_url
     await init_db()
+    for key, cfg in ENGAGEMENT_SCENARIOS.items():
+        await ensure_engagement_setting(key, cfg.get("default", ""))
 
     application = build_application()
     await application.initialize()
@@ -3897,6 +4394,7 @@ async def on_startup():
     threading.Thread(target=_keepalive_loop, daemon=True).start()
     asyncio.get_event_loop().create_task(_webhook_guard_loop())
     asyncio.get_event_loop().create_task(_premium_expiry_notifier_loop())
+    asyncio.get_event_loop().create_task(_engagement_trigger_loop())
 
     logger.info("🚀 Startup complete. Listening on port %s", PORT)
 
